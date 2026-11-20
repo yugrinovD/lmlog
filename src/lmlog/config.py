@@ -7,7 +7,6 @@ the CLI, the daemon and the Docker image consistent.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 DEFAULT_MODEL = "qwen2.5:3b"
 DEFAULT_OLLAMA_HOST = "127.0.0.1:11434"
@@ -37,8 +36,3 @@ def default_model() -> str:
 
 def ollama_host() -> str:
     return os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
-
-
-def ensure_parent(path: str) -> None:
-    parent = Path(path).expanduser().resolve().parent
-    parent.mkdir(parents=True, exist_ok=True)

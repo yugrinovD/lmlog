@@ -53,3 +53,30 @@ def test_clusterer_merge():
     b.add(entry("2026-08-25T10:00:01+00:00", "INFO", "x"))
     a.merge(b)
     assert a.clusters["x"].count == 2
+
+
+def test_mixed_timezones_are_ordered_chronologically():
+    cluster = Cluster("sig")
+    # 11:00+03:00 == 08:00Z, which is earlier than 09:00+00:00.
+    cluster.add(entry("2026-08-25T11:00:00+03:00", "INFO", "sig"))
+    cluster.add(entry("2026-08-25T09:00:00+00:00", "INFO", "sig"))
+    assert cluster.first_ts == "2026-08-25T11:00:00+03:00"
+    assert cluster.last_ts == "2026-08-25T09:00:00+00:00"
+
+
+def test_merge_mixed_timezones():
+    left = Cluster("sig")
+    left.add(entry("2026-08-25T11:00:00+03:00", "INFO", "sig"))
+    right = Cluster("sig")
+    right.add(entry("2026-08-25T09:00:00+00:00", "INFO", "sig"))
+    left.merge(right)
+    assert left.first_ts == "2026-08-25T11:00:00+03:00"
+    assert left.last_ts == "2026-08-25T09:00:00+00:00"
+
+
+def test_z_timestamp_suffix_is_supported():
+    cluster = Cluster("sig")
+    cluster.add(entry("2026-08-25T11:00:00Z", "INFO", "sig"))
+    cluster.add(entry("2026-08-25T12:00:00+00:00", "INFO", "sig"))
+    assert cluster.first_ts == "2026-08-25T11:00:00Z"
+    assert cluster.last_ts == "2026-08-25T12:00:00+00:00"

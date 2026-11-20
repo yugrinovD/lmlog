@@ -14,6 +14,7 @@ import json
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 try:  # optional acceleration
     import orjson as _orjson
@@ -23,6 +24,23 @@ except ImportError:  # pragma: no cover - optional dependency
 
 def _loads(text: str):
     return _orjson.loads(text) if _orjson is not None else json.loads(text)
+
+
+def ts_sort_key(ts: str) -> str:
+    """Return a lexicographically sortable UTC key for a Monolog timestamp.
+
+    Log timestamps carry offsets (``+03:00``), so comparing the raw strings is
+    wrong when files come from different time zones. Canonicalising to UTC makes
+    ``MIN``/``MAX`` and ``<`` comparisons chronological again.
+    """
+    try:
+        # Python 3.10's fromisoformat does not accept the "Z" suffix.
+        value = datetime.fromisoformat(ts[:-1] + "+00:00" if ts.endswith("Z") else ts)
+    except (TypeError, ValueError):
+        return ts
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 LINE_RE = re.compile(

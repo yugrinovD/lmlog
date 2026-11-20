@@ -44,7 +44,13 @@ def daemon_status(db_path: str) -> dict:
     return info
 
 
-def start_daemon(db_path: str, log_dir: str, interval: int) -> int:
+def start_daemon(
+    db_path: str,
+    log_dir: str,
+    interval: int,
+    since_hours: int | None = None,
+    workers: int = 0,
+) -> int:
     base = _base_dir(db_path)
     os.makedirs(base, exist_ok=True)
     pid_file = os.path.join(base, PID_FILE)
@@ -70,6 +76,10 @@ def start_daemon(db_path: str, log_dir: str, interval: int) -> int:
     ]
     if log_dir:
         cmd += ["--log-dir", log_dir]
+    if since_hours is not None:
+        cmd += ["--since", str(since_hours)]
+    if workers:
+        cmd += ["--workers", str(workers)]
     log_file = os.path.join(base, LOG_FILE)
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
@@ -111,7 +121,7 @@ def run_foreground(
     db_path: str,
     log_dir: str,
     interval: int,
-    since_hours: int | None = 24,
+    since_hours: int | None = None,
     workers: int = 0,
 ) -> int:
     from .cli import run_ingest

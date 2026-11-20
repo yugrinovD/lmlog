@@ -269,6 +269,7 @@ class _DayWriter:
         self.append = append
         self.index = 0
         self.path = ""
+        self.paths: list[str] = []
         self.fh = None
         self.size = 0
         self._open()
@@ -282,6 +283,8 @@ class _DayWriter:
         mode = "a" if (self.append and self.index == 0) else "w"
         self.fh = open(self.path, mode, encoding="utf-8")
         self.size = os.path.getsize(self.path) if mode == "a" else 0
+        if self.path not in self.paths:
+            self.paths.append(self.path)
 
     def write(self, line: str) -> None:
         data = line.encode("utf-8")
@@ -348,7 +351,7 @@ def generate_to_dir(
             writer.write(format_line(ts, event) + "\n")
             total_written += 1
         writer.close()
-        files.append(writer.path)
+        files.extend(writer.paths)
 
     return {
         "lines": total_written,
@@ -392,4 +395,10 @@ def stream_logs(
         pass
     finally:
         writer.close()
-    return {"lines": written, "file": writer.path, "profile": profile, "rate": rate}
+    return {
+        "lines": written,
+        "file": writer.path,
+        "files": writer.paths,
+        "profile": profile,
+        "rate": rate,
+    }

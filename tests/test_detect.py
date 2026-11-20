@@ -48,3 +48,39 @@ def test_trend_new_pattern():
     daily = {"newbie": {"2026-08-25": 5}}
     findings = detect_trends([cluster], daily, top_n=10)
     assert any(finding.kind == "new_trend" for finding in findings)
+
+
+def test_full_silence_is_detected_via_global_latest_date():
+    silent = make_cluster("silent", {"INFO": 2000})
+    other = make_cluster("other", {"INFO": 10})
+    daily = {
+        "silent": {"2026-08-24": 1000, "2026-08-25": 1000},
+        "other": {"2026-08-24": 10, "2026-08-25": 10, "2026-08-26": 10},
+    }
+    findings = detect_trends([silent, other], daily, top_n=10)
+    drop = next(finding for finding in findings if finding.signature == "silent")
+    assert drop.count == 0
+    assert "sharp drop" in drop.note
+
+
+def test_spike_then_normal_is_not_a_drop():
+    cluster = make_cluster("spiky", {"INFO": 1200})
+    other = make_cluster("other", {"INFO": 10})
+    daily = {
+        "spiky": {"2026-08-23": 100, "2026-08-24": 1000, "2026-08-25": 100},
+        "other": {"2026-08-23": 10, "2026-08-24": 10, "2026-08-25": 10},
+    }
+    findings = detect_trends([cluster, other], daily, top_n=10)
+    assert not any(finding.signature == "spiky" for finding in findings)
+
+
+def test_spike_is_anchored_to_global_latest_date():
+    cluster = make_cluster("spiky", {"INFO": 1100})
+    other = make_cluster("other", {"INFO": 10})
+    daily = {
+        "spiky": {"2026-08-23": 100, "2026-08-24": 100, "2026-08-25": 1000},
+        "other": {"2026-08-23": 10, "2026-08-24": 10, "2026-08-25": 10},
+    }
+    findings = detect_trends([cluster, other], daily, top_n=10)
+    growth = next(finding for finding in findings if finding.signature == "spiky")
+    assert "anomalous growth on 2026-08-25" in growth.note

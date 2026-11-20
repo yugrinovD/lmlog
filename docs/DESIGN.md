@@ -48,9 +48,14 @@ parser ──► normalizer ──► signature ──► clusterer + daily coun
 - A byte offset is stored per file. The reader never decodes a partial line:
   only complete lines advance the offset, so an in-progress write is picked up on
   the next pass without double counting.
-- Rotation is detected by **inode change** or a decrease in file size. In both
-  cases the file is re-read from the beginning.
+- Rotation is detected by **inode change** or a decrease in file size. During an
+  incremental pass this switches the run into **rebuild mode**: the selected file
+  set is re-read from the beginning and the snapshot/daily counters are replaced
+  instead of appended. This avoids double counting regardless of rotation style
+  (rename/create, copytruncate).
 - Entries are streamed into the clusterer; no list of all entries is created.
+- Physical lines and parsed entries are counted separately, so malformed lines
+  are visible in statistics without being treated as events.
 
 ### 2. Normalisation and signatures
 
@@ -76,17 +81,19 @@ Each signature keeps:
 - total count;
 - per-level counts (for error detection);
 - per-class counts;
-- first/last timestamps;
+- first/last timestamps (stored for display, compared via canonical UTC keys);
 - one sample message/raw line/context for explanations.
 
 Clusters are merged across worker processes by summing counters and combining
-first/last timestamps.
+first/last timestamps. Within a file, same-offset timestamps take a fast string
+comparison path; mixed offsets are parsed and normalised to UTC.
 
 ### 4. Daily history
 
 Every entry contributes to a `(signature, date, count)` counter. Full ingests
-replace the counters for the dates they read; incremental ingests add to them.
-This table drives trend detection and is intentionally small.
+(including rotation-triggered rebuilds) replace the counters for the dates they
+read; incremental ingests add only the delta. This table drives trend detection
+and is intentionally small.
 
 ### 5. Reactive detection
 
@@ -96,10 +103,14 @@ This table drives trend detection and is intentionally small.
 
 ### 6. Proactive trends
 
-- **Spike**: the latest day is greater than the median of previous days by a
-  configurable factor (default 3x).
-- **Drop**: a previously frequent pattern has almost stopped appearing.
-- **New**: a signature first seen inside the observation window.
+- All comparisons are anchored to the **globally latest date** across all
+  signatures; missing days count as zero.
+- **Spike**: the latest day is greater than the median of active previous days
+  in the observation window by a configurable factor (default 3x).
+- **Drop**: a previously frequent pattern has stopped or sharply dropped. The
+  baseline is the minimum active previous day, so a single spike followed by
+  normal volume is not misread as a drop; a complete silence is detected.
+- **New**: a signature first seen (on a single day) inside the observation window.
 
 These are rule-based and require no model.
 
@@ -123,14 +134,17 @@ SQLite is used for all state:
 | Table | Purpose |
 | --- | --- |
 | `offsets` | per-file byte offset, mtime, inode |
-| `clusters` | lifetime signature history (first/last seen, total count) |
+| `clusters` | signature catalog (first/last seen in UTC, total count) |
 | `daily_counts` | per-day frequencies for trends |
 | `snapshot` | clusters of the latest ingest for fast queries |
 | `explanations` | cache for LLM/heuristic explanations |
 | `meta` | snapshot timestamp and period |
 
 WAL mode and `executemany` batching keep writes fast. The snapshot is replaced
-on each ingest, while `clusters` and `daily_counts` accumulate history.
+on each ingest. `daily_counts` accumulates history for incremental passes and is
+replaced for fully read dates. `clusters` is a catalog: a full ingest resets the
+counters of the signatures it reads (idempotent re-ingests), while an incremental
+ingest adds only the delta and keeps `MIN(first_seen)` / `MAX(last_seen)`.
 
 ## Scaling considerations
 
@@ -155,6 +169,11 @@ on each ingest, while `clusters` and `daily_counts` accumulate history.
 - LLM explanations are per unique signature. This keeps CPU usage predictable.
 - The parser targets Monolog; unstructured lines are still counted but have no
   context.
+- Rotation during an incremental pass triggers a rebuild of the selected file
+  set. This is more expensive than per-file contribution tracking, but it is
+  simple and correct for all rotation styles.
+- Compressed `*.gz` files are skipped (with a warning). Streaming compressed
+  files would need a different offset model.
 
 ## Possible extensions
 

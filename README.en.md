@@ -183,6 +183,19 @@ errors=410  total=410  first=2026-08-25T00:02:35  last=2026-08-25T23:53:49
 
 Full help: `lmlog <command> --help`.
 
+## Data correctness
+
+- `clusters` is a signature catalog: a full ingest rebuilds counters for the
+  selected file set, while incremental ingest adds only the delta of the new
+  pass. Re-running a full ingest is idempotent.
+- If a rotated or truncated file is detected during incremental ingest, `lmlog`
+  rebuilds the snapshot from the selected files. This is more expensive but
+  prevents double counting.
+- Timestamps are compared in UTC, so offsets (`+03:00`, `Z`) do not break
+  `first_seen`/`last_seen` ordering.
+- Physical lines and successfully parsed entries are counted separately, so
+  malformed lines remain visible without inflating throughput.
+
 ## Scale and performance
 
 `lmlog` is designed for **50M+ lines per day**:
@@ -198,8 +211,8 @@ Measurement on a synthetic stress profile (single process, regular dev machine):
 
 ```text
 $ lmlog bench --lines 1000000
-Throughput      : ~90 000 lines/s
-50M lines at this rate: ~9.2 min
+Throughput      : ~85 000 lines/s
+50M lines at this rate: ~9.8 min
 ```
 
 Numbers depend on hardware, line format and JSON share. This is a reference
@@ -256,7 +269,7 @@ ruff check .
 lmlog bench --lines 1000000
 ```
 
-CI: GitHub Actions, Python 3.11/3.12, lint + tests.
+CI: GitHub Actions, Python 3.10–3.13, lint + tests.
 
 ## Project layout
 
@@ -271,6 +284,7 @@ src/lmlog/
   explain.py     # heuristic explanations
   llm.py         # Ollama client
   generator.py   # synthetic log generator
+  config.py      # configuration and environment
   cli.py         # command line interface
   wizard.py      # interactive mode
   daemon.py      # background refresh
@@ -286,6 +300,9 @@ examples/        # sample log
 - A CPU LLM explains dozens of unique templates, not the line stream — this is a
   deliberate architectural choice.
 - SQLite is a single state store; this is sufficient for one host and one log set.
+- Rotation during incremental ingest triggers a rebuild of the selected file
+  set (a full pass); correctness is preferred over minimal work.
+- Compressed `*.gz` files are not read; a warning is printed when they exist.
 
 ## License
 

@@ -53,3 +53,10 @@ def test_stream_logs(tmp_path):
     result = stream_logs(str(tmp_path), rate=200, duration=0.15, seed=4)
     assert result["lines"] > 0
     assert Path(result["file"]).exists()
+
+
+def test_rotation_returns_every_file(tmp_path):
+    result = generate_to_dir(str(tmp_path), lines=5000, seed=2, rotate_bytes=20_000)
+    files_on_disk = sorted(Path(tmp_path).glob("*.log"))
+    assert len(files_on_disk) > 1
+    assert sorted(result["files"]) == [str(path) for path in files_on_disk]

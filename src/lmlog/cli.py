@@ -15,6 +15,7 @@ from .ingest import (
     list_log_files,
     merge_result,
     plan_tasks,
+    process_file_into_safe,
     read_journal,
     run_tasks,
 )
@@ -47,9 +48,11 @@ def run_ingest(
     """Read logs, cluster signatures and persist a snapshot.
 
     With ``incremental=True`` only new bytes are read and the existing
-    snapshot is extended instead of replaced.
+    snapshot is extended. If a rotated/truncated file is detected, the selected
+    file set is rebuilt from scratch so counts stay correct.
     """
-    files = list_log_files(log_dir)
+    all_files = list_log_files(log_dir)
+    files = all_files
     # In incremental mode offsets decide what is new; filtering by mtime could
     # skip files that still contain unread data after an outage.
     if since_hours and not incremental:
@@ -58,66 +61,88 @@ def run_ingest(
     if limit_files:
         files = files[-limit_files:]
 
-    if incremental:
-        clusterer = state.load_snapshot()
-        if files:
-            fresh = sum(1 for path in files if state.get_offset(path)[0] == 0)
-            if fresh == len(files):
-                print(
-                    "WARNING: no saved offsets (fresh database?); "
-                    "incremental mode will read files from the beginning."
-                )
-    else:
-        clusterer = Clusterer()
+    if os.path.isdir(log_dir):
+        state.prune_offsets(log_dir, all_files)
 
     if not files:
         print(f"No log files found in {log_dir}; nothing to ingest.")
+        snapshot = state.load_snapshot() if incremental else Clusterer()
         return {
             "elapsed": 0.0,
             "files": 0,
             "total_entries": 0,
             "total_lines": 0,
-            "unique_sigs": len(clusterer.clusters),
+            "unique_sigs": len(snapshot.clusters),
             "findings": [],
-            "clusterer": clusterer,
+            "clusterer": snapshot,
             "rate": 0.0,
         }
 
+    tasks, rotated = plan_tasks(state, files, full=not incremental)
+    rebuild = bool(incremental and rotated)
+    if rebuild:
+        print("Rotation detected; rebuilding the snapshot from the selected files.")
+        tasks = plan_tasks(state, files, full=True)[0]
+    effective_incremental = incremental and not rebuild
+
+    known = state.known_signatures()
+    first_run = not known
     started = time.time()
+    delta = Clusterer()
     daily: dict = {}
     total_entries = 0
     total_lines = 0
+    offset_rows = []
 
-    tasks = plan_tasks(state, files, full=not incremental)
-    results = run_tasks(tasks, workers)
-    if not results:
+    if workers and workers > 1 and len(tasks) > 1:
+        results = run_tasks(tasks, workers)
+        for (source, cursor), result in results:
+            merge_result(delta, daily, result)
+            total_entries += result["entries"]
+            total_lines += result["lines"]
+            offset_rows.append((source, *cursor))
+    else:
+        for task in tasks:
+            outcome = process_file_into_safe(task, delta, daily)
+            if outcome is None:
+                continue
+            (source, cursor), lines, entries = outcome
+            total_lines += lines
+            total_entries += entries
+            offset_rows.append((source, *cursor))
+
+    if not offset_rows:
         print("No files could be read; the snapshot was left unchanged.")
+        snapshot = state.load_snapshot() if effective_incremental else Clusterer()
         return {
             "elapsed": time.time() - started,
             "files": len(files),
             "total_entries": 0,
             "total_lines": 0,
-            "unique_sigs": len(clusterer.clusters),
+            "unique_sigs": len(snapshot.clusters),
             "findings": [],
-            "clusterer": clusterer,
+            "clusterer": snapshot,
             "rate": 0.0,
         }
 
-    offset_rows = []
-    for (source, cursor), result in results:
-        merge_result(clusterer, daily, result)
-        total_entries += result["entries"]
-        total_lines += result["lines"]
-        offset_rows.append((source, *cursor))
     state.set_offsets(offset_rows)
-    replace_dates = set() if incremental else {d for by_date in daily.values() for d in by_date}
+    if effective_incremental:
+        snapshot = state.load_snapshot()
+        snapshot.merge(delta)
+        record_mode = "incremental"
+        replace_dates: set[str] = set()
+    else:
+        snapshot = delta
+        record_mode = "full"
+        replace_dates = {d for by_date in daily.values() for d in by_date}
     if daily:
         state.upsert_daily(daily, replace_dates)
 
-    known = state.known_signatures()
-    findings = detect(list(clusterer.clusters.values()), known)
-    state.record_clusters(clusterer.clusters.values())
-    state.save_snapshot(clusterer.clusters.values(), since_hours)
+    findings = detect(list(snapshot.clusters.values()), known)
+    if first_run:
+        findings = [finding for finding in findings if finding.kind != "new"]
+    state.record_clusters(delta.clusters.values(), mode=record_mode)
+    state.save_snapshot(snapshot.clusters.values(), since_hours)
 
     elapsed = time.time() - started
     return {
@@ -125,9 +150,9 @@ def run_ingest(
         "files": len(files),
         "total_entries": total_entries,
         "total_lines": total_lines,
-        "unique_sigs": len(clusterer.clusters),
+        "unique_sigs": len(snapshot.clusters),
         "findings": findings,
-        "clusterer": clusterer,
+        "clusterer": snapshot,
         "rate": total_lines / elapsed if elapsed else 0.0,
     }
 
@@ -353,7 +378,19 @@ def cmd_trends(args) -> int:
     from .llm import OllamaClient
 
     state = State(args.db)
-    clusterer, created = load_clusters(state)
+    if args.live or args.incremental:
+        result = run_ingest(
+            state,
+            args.log_dir,
+            args.since,
+            args.limit,
+            incremental=args.incremental,
+            workers=args.workers,
+        )
+        clusterer = result["clusterer"]
+        created = None
+    else:
+        clusterer, created = load_clusters(state)
     daily = state.load_daily()
     if not daily:
         print("No day-by-day history yet. Run ingest over several days first:")
@@ -415,7 +452,7 @@ def cmd_journal(args) -> int:
     clusterer = Clusterer()
     count = 0
     errors = 0
-    for entry in read_journal(since=args.since, use_sudo=args.sudo):
+    for entry in read_journal(since=args.since, use_sudo=args.sudo, timeout=args.timeout):
         if args.level and entry.level != args.level:
             continue
         count += 1
@@ -441,7 +478,13 @@ def cmd_daemon(args) -> int:
 
     db = args.db or default_db()
     if args.foreground:
-        return run_foreground(db, args.log_dir, args.interval, since_hours=24, workers=args.workers)
+        return run_foreground(
+            db,
+            args.log_dir,
+            args.interval,
+            since_hours=args.since,
+            workers=args.workers,
+        )
     if args.status:
         status = daemon_status(db)
         if status["running"]:
@@ -456,7 +499,13 @@ def cmd_daemon(args) -> int:
         return 0
     if args.stop:
         return stop_daemon(db)
-    return start_daemon(db, args.log_dir, args.interval)
+    return start_daemon(
+        db,
+        args.log_dir,
+        args.interval,
+        since_hours=args.since,
+        workers=args.workers,
+    )
 
 
 def cmd_bench(args) -> int:
@@ -618,6 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     journal.add_argument("--level", default=None, choices=["INFO", "ERROR", "WARNING"])
     journal.add_argument("--show", action="store_true")
     journal.add_argument("--sudo", action="store_true", help="call journalctl through sudo -n")
+    journal.add_argument(
+        "--timeout", type=float, default=30, help="kill journalctl after N seconds"
+    )
     journal.add_argument("--clusters", type=int, default=15)
     journal.set_defaults(func=cmd_journal)
 

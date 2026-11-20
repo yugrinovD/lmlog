@@ -1,8 +1,8 @@
 # lmlog has no mandatory third-party runtime dependencies.
-# It uses only the Python standard library.
+# The project metadata in pyproject.toml is the single source of truth.
 #
-# Optional acceleration:
-# orjson>=3.9
-
-# Optional local LLM integration is provided through Ollama (HTTP),
-# not through Python packages.
+# Local development:
+#   pip install -e ".[dev]"
+#
+# Optional JSON acceleration:
+#   pip install -e ".[fast]"

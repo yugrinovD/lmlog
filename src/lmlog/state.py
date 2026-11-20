@@ -9,6 +9,8 @@ import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 
+from .parser import ts_sort_key
+
 
 class State:
     def __init__(self, db_path: str):
@@ -123,14 +125,47 @@ class State:
     # --- offsets / progress ---
 
     def get_offset(self, source: str) -> tuple[int, float, int, int]:
+        return self.get_offsets([source]).get(source, (0, 0.0, 0, 0))
+
+    def get_offsets(self, sources: Iterable[str]) -> dict[str, tuple[int, float, int, int]]:
+        """Return offsets for many sources using a bounded number of queries."""
+        unique = list(dict.fromkeys(sources))
+        result: dict[str, tuple[int, float, int, int]] = {}
+        if not unique:
+            return result
         with self.conn() as con:
-            row = con.execute(
-                "SELECT size, mtime, lineno, inode FROM offsets WHERE source=?",
-                (source,),
-            ).fetchone()
-        if row is None:
-            return 0, 0.0, 0, 0
-        return row["size"], row["mtime"], row["lineno"], row["inode"] or 0
+            for index in range(0, len(unique), 500):
+                chunk = unique[index : index + 500]
+                marks = ",".join("?" * len(chunk))
+                rows = con.execute(
+                    f"SELECT source, size, mtime, lineno, inode FROM offsets WHERE source IN ({marks})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    result[row["source"]] = (
+                        row["size"],
+                        row["mtime"],
+                        row["lineno"],
+                        row["inode"] or 0,
+                    )
+        return result
+
+    def prune_offsets(self, log_dir: str, existing: Iterable[str]) -> int:
+        """Remove offsets for files under ``log_dir`` that no longer exist."""
+        base = os.path.abspath(log_dir).rstrip(os.sep) + os.sep
+        keep = set(existing)
+        with self.conn() as con:
+            rows = con.execute("SELECT source FROM offsets").fetchall()
+            stale = [
+                row["source"]
+                for row in rows
+                if row["source"].startswith(base) and row["source"] not in keep
+            ]
+            if stale:
+                con.executemany(
+                    "DELETE FROM offsets WHERE source=?", [(source,) for source in stale]
+                )
+        return len(stale)
 
     def set_offset(self, source: str, size: int, mtime: float, lineno: int, inode: int = 0) -> None:
         with self.conn() as con:
@@ -169,12 +204,18 @@ class State:
             rows = con.execute("SELECT signature FROM clusters").fetchall()
         return {r["signature"] for r in rows}
 
-    def record_clusters(self, clusters: Iterable) -> None:
+    def record_clusters(self, clusters: Iterable, mode: str = "incremental") -> None:
+        """Update the signature catalog.
+
+        ``mode="incremental"`` adds the delta of the current pass and keeps the
+        lifetime first/last timestamps. ``mode="full"`` rebuilds the catalog for
+        the ingested dataset (idempotent re-ingests).
+        """
         rows = [
             (
                 c.signature,
-                c.first_ts,
-                c.last_ts,
+                c.first_key or (ts_sort_key(c.first_ts) if c.first_ts else ""),
+                c.last_key or (ts_sort_key(c.last_ts) if c.last_ts else ""),
                 c.count,
                 json.dumps(
                     {
@@ -191,16 +232,36 @@ class State:
         ]
         if not rows:
             return
+        if mode == "full":
+            update = """
+                first_seen=excluded.first_seen,
+                last_seen=excluded.last_seen,
+                total_count=excluded.total_count,
+                metadata=excluded.metadata
+            """
+        else:
+            update = """
+                first_seen = CASE
+                    WHEN clusters.first_seen IS NULL OR clusters.first_seen = '' THEN excluded.first_seen
+                    WHEN excluded.first_seen IS NULL OR excluded.first_seen = '' THEN clusters.first_seen
+                    WHEN excluded.first_seen < clusters.first_seen THEN excluded.first_seen
+                    ELSE clusters.first_seen
+                END,
+                last_seen = CASE
+                    WHEN clusters.last_seen IS NULL OR clusters.last_seen = '' THEN excluded.last_seen
+                    WHEN excluded.last_seen IS NULL OR excluded.last_seen = '' THEN clusters.last_seen
+                    WHEN excluded.last_seen > clusters.last_seen THEN excluded.last_seen
+                    ELSE clusters.last_seen
+                END,
+                total_count=COALESCE(clusters.total_count, 0) + excluded.total_count,
+                metadata=excluded.metadata
+            """
         with self.conn() as con:
             con.executemany(
-                """
+                f"""
                 INSERT INTO clusters(signature, first_seen, last_seen, total_count, metadata)
                 VALUES(?,?,?,?,?)
-                ON CONFLICT(signature) DO UPDATE SET
-                    first_seen=excluded.first_seen,
-                    last_seen=excluded.last_seen,
-                    total_count=clusters.total_count+excluded.total_count,
-                    metadata=excluded.metadata
+                ON CONFLICT(signature) DO UPDATE SET {update}
                 """,
                 rows,
             )
@@ -280,6 +341,8 @@ class State:
             cluster.classes.update(json.loads(row["classes"] or "{}"))
             cluster.first_ts = row["first_ts"] or ""
             cluster.last_ts = row["last_ts"] or ""
+            cluster.first_key = ts_sort_key(cluster.first_ts) if cluster.first_ts else ""
+            cluster.last_key = ts_sort_key(cluster.last_ts) if cluster.last_ts else ""
             cluster.sample_message = row["sample_message"] or ""
             cluster.sample_raw = row["sample_raw"] or ""
             try:

@@ -12,6 +12,7 @@ def test_end_to_end(tmp_path, capsys):
     assert main(["classes", "--db", str(db), "Handler", "-n", "3"]) == 0
     assert main(["explain", "--db", str(db), "--no-llm", "-n", "2"]) == 0
     assert main(["trends", "--db", str(db), "-n", "2"]) == 0
+    assert main(["trends", "--db", str(db), "--log-dir", str(logs), "--live", "-n", "2"]) == 0
     assert main(["status", "--db", str(db)]) == 0
 
     output = capsys.readouterr().out
