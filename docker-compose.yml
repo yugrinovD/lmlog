@@ -1,0 +1,72 @@
+name: lmlog
+
+services:
+  # One-shot: generates synthetic logs into the shared `logs` volume.
+  generator:
+    build: .
+    image: lmlog:local
+    command:
+      - generate
+      - --out
+      - /data/logs
+      - --lines
+      - ${LMLOG_DEMO_LINES:-200000}
+      - --days
+      - ${LMLOG_DEMO_DAYS:-1}
+      - --profile
+      - demo
+    volumes:
+      - logs:/data/logs
+
+  # On-demand CLI: `docker compose run --rm lmlog <command>`
+  lmlog:
+    build: .
+    image: lmlog:local
+    command: ["--help"]
+    restart: "no"
+    environment:
+      LMLOG_DB: /state/lmlog.db
+      LMLOG_LOG_DIR: /data/logs
+      OLLAMA_HOST: ${OLLAMA_HOST:-ollama:11434}
+      LMLOG_MODEL: ${LMLOG_MODEL:-qwen2.5:3b}
+    volumes:
+      - logs:/data/logs
+      - state:/state
+
+  # Long-running: keeps the snapshot fresh with incremental ingests.
+  daemon:
+    build: .
+    image: lmlog:local
+    profiles: ["daemon"]
+    command:
+      - daemon
+      - --foreground
+      - --interval
+      - ${LMLOG_DAEMON_INTERVAL:-300}
+    restart: unless-stopped
+    environment:
+      LMLOG_DB: /state/lmlog.db
+      LMLOG_LOG_DIR: /data/logs
+      OLLAMA_HOST: ${OLLAMA_HOST:-ollama:11434}
+      LMLOG_MODEL: ${LMLOG_MODEL:-qwen2.5:3b}
+    volumes:
+      - logs:/data/logs
+      - state:/state
+    depends_on:
+      generator:
+        condition: service_completed_successfully
+
+  # Optional local LLM for AI explanations: `make llm`
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+volumes:
+  logs:
+  state:
+  ollama:

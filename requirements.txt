@@ -1,0 +1,8 @@
+# lmlog has no mandatory third-party runtime dependencies.
+# It uses only the Python standard library.
+#
+# Optional acceleration:
+# orjson>=3.9
+
+# Optional local LLM integration is provided through Ollama (HTTP),
+# not through Python packages.
