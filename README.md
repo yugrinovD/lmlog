@@ -145,7 +145,7 @@ errors=410  total=410  first=2026-08-25T00:02:35  last=2026-08-25T23:53:49
   msg: Uncaught PHP Exception Doctrine\DBAL\Exception\IntegrityConstraintViolationException
 ```
 
-## Демо-сценарий для портфолио
+## Демо сценарий
 
 1. **Генерация**: `lmlog generate --lines 200000 --days 7 --profile demo` —
    семь дней реалистичного потока (шум + повторяющиеся ошибки). Для многодневного
