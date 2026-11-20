@@ -51,7 +51,9 @@ def list_log_files(log_dir: str, patterns=DEFAULT_PATTERNS) -> list[str]:
         if not os.path.isfile(full):
             continue
         if name.endswith(".gz"):
-            skipped_gz = True
+            # Warn only when the uncompressed name would have matched a pattern.
+            if any(fnmatch.fnmatch(name[:-3], pattern) for pattern in patterns):
+                skipped_gz = True
             continue
         if full in seen:
             continue
@@ -129,6 +131,14 @@ def process_file_into(
 
     cursor = stat_cursor(path)
     return (source, (last_offset, cursor.mtime, last_lineno, cursor.inode)), lines, entries
+
+
+def process_file_local(task: tuple[str, int, int, str]):
+    """Process one file into local aggregates (safe to merge only on success)."""
+    clusterer = Clusterer()
+    daily: dict = {}
+    cursor, lines, entries = process_file_into(task, clusterer, daily)
+    return cursor, clusterer, daily, lines, entries
 
 
 def process_file(task: tuple[str, int, int, str]) -> tuple[tuple, dict]:
@@ -211,7 +221,7 @@ def process_file_into_safe(task: tuple[str, int, int, str], clusterer: Clusterer
 
 
 def run_tasks(tasks: list, workers: int = 0) -> list:
-    """Run tasks sequentially or in a process pool. Returns result tuples."""
+    """Run tasks sequentially or in a process pool. Returns successful results."""
     if workers and workers > 1 and len(tasks) > 1:
         from concurrent.futures import ProcessPoolExecutor
 
@@ -220,6 +230,16 @@ def run_tasks(tasks: list, workers: int = 0) -> list:
     else:
         results = [process_file_safe(task) for task in tasks]
     return [result for result in results if result is not None]
+
+
+def run_tasks_strict(tasks: list, workers: int = 0) -> list:
+    """Run tasks without swallowing errors (used by full rebuilds)."""
+    if workers and workers > 1 and len(tasks) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(process_file, tasks))
+    return [process_file(task) for task in tasks]
 
 
 # --- journald (best effort, optional) ---

@@ -185,12 +185,15 @@ Full help: `lmlog <command> --help`.
 
 ## Data correctness
 
-- `clusters` is a signature catalog: a full ingest rebuilds counters for the
-  selected file set, while incremental ingest adds only the delta of the new
-  pass. Re-running a full ingest is idempotent.
+- `clusters` is a signature catalog: **every full ingest rebuilds all files in
+  `log_dir`** (the `--since`/`--limit` filters are ignored for it), while
+  incremental ingest adds only the delta of the new pass. Re-running a full
+  ingest is idempotent.
 - If a rotated or truncated file is detected during incremental ingest, `lmlog`
-  rebuilds the snapshot from the selected files. This is more expensive but
-  prevents double counting.
+  rebuilds the snapshot from **all** files in `log_dir`. This is more expensive
+  but prevents double counting.
+- Version 1.0.0 databases are rebuilt automatically on the first `ingest`
+  (schema migration 1 → 2).
 - Timestamps are compared in UTC, so offsets (`+03:00`, `Z`) do not break
   `first_seen`/`last_seen` ordering.
 - Physical lines and successfully parsed entries are counted separately, so
@@ -300,9 +303,13 @@ examples/        # sample log
 - A CPU LLM explains dozens of unique templates, not the line stream — this is a
   deliberate architectural choice.
 - SQLite is a single state store; this is sufficient for one host and one log set.
-- Rotation during incremental ingest triggers a rebuild of the selected file
-  set (a full pass); correctness is preferred over minimal work.
-- Compressed `*.gz` files are not read; a warning is printed when they exist.
+- Rotation during incremental ingest triggers a rebuild of all files in
+  `log_dir` (a full pass); `--since`/`--limit` are ignored for full/rebuild.
+- Copytruncate, where a file is truncated and grows back to its previous size
+  between checks, may be missed. Rename/create rotation or a size decrease
+  between checks is more reliable.
+- Compressed `*.gz` files are not read; a warning is printed only when the name
+  matches the log patterns.
 
 ## License
 

@@ -84,3 +84,10 @@ def test_spike_is_anchored_to_global_latest_date():
     findings = detect_trends([cluster, other], daily, top_n=10)
     growth = next(finding for finding in findings if finding.signature == "spiky")
     assert "anomalous growth on 2026-08-25" in growth.note
+
+
+def test_spike_factor_must_be_positive():
+    import pytest
+
+    with pytest.raises(ValueError):
+        detect_trends([], {}, spike_factor=0)

@@ -143,11 +143,17 @@ def run_foreground(
                 incremental=True,
                 workers=workers,
             )
-            print(
-                f"[{time.strftime('%H:%M:%S')}] ingest: +{result['total_lines']} lines, "
-                f"signatures={result['unique_sigs']}, {result['elapsed']:.1f}s",
-                flush=True,
-            )
+            if result["status"] == "ok":
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] ingest: +{result['total_lines']} lines, "
+                    f"signatures={result['unique_sigs']}, {result['elapsed']:.1f}s",
+                    flush=True,
+                )
+            elif result["status"] == "aborted":
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] ingest aborted; snapshot left unchanged",
+                    flush=True,
+                )
         except Exception as exc:  # noqa: BLE001 - keep the daemon alive
             print(f"[{time.strftime('%H:%M:%S')}] ingest failed: {exc}", flush=True)
         sleep_for = max(1, interval - (time.time() - started))

@@ -117,7 +117,10 @@ def ensure_ingested(state, args) -> bool:
     )
     answer = _ask("Read logs now?", "y")
     if answer.lower() in ("y", "yes", "д", "да"):
-        run_ingest(state, args.log_dir, 24, None, incremental=False)
+        result = run_ingest(state, args.log_dir, 24, None, incremental=False)
+        if result["status"] != "ok":
+            print(c("Ingest did not complete; check the errors above.", "yellow"))
+            return False
         print(c("Done. Data loaded.", "green"))
         return True
     print("Cancelled. Run `lmlog ingest` first.")

@@ -49,10 +49,15 @@ parser ──► normalizer ──► signature ──► clusterer + daily coun
   only complete lines advance the offset, so an in-progress write is picked up on
   the next pass without double counting.
 - Rotation is detected by **inode change** or a decrease in file size. During an
-  incremental pass this switches the run into **rebuild mode**: the selected file
-  set is re-read from the beginning and the snapshot/daily counters are replaced
-  instead of appended. This avoids double counting regardless of rotation style
-  (rename/create, copytruncate).
+  incremental pass this switches the run into **rebuild mode**: every file in
+  `log_dir` is re-read from the beginning and the snapshot/daily/catalog are
+  replaced instead of appended. A full ingest is always such a rebuild and
+  ignores `--since`/`--limit`.
+- Detection covers rename/create rotation and truncation that shrinks the file.
+  **copytruncate** can be missed if the file is truncated and grows back to (or
+  beyond) its previous size between checks; this is a documented limitation.
+- A legacy 1.0.0 database sets `rebuild_required` and is rebuilt automatically
+  on the first ingest (schema migration 1 → 2).
 - Entries are streamed into the clusterer; no list of all entries is created.
 - Physical lines and parsed entries are counted separately, so malformed lines
   are visible in statistics without being treated as events.
@@ -136,15 +141,16 @@ SQLite is used for all state:
 | `offsets` | per-file byte offset, mtime, inode |
 | `clusters` | signature catalog (first/last seen in UTC, total count) |
 | `daily_counts` | per-day frequencies for trends |
-| `snapshot` | clusters of the latest ingest for fast queries |
+| `snapshot` | clusters of the latest ingest plus stored UTC sort keys |
 | `explanations` | cache for LLM/heuristic explanations |
-| `meta` | snapshot timestamp and period |
+| `meta` | snapshot timestamp, period, `schema_version`, `rebuild_required` |
 
-WAL mode and `executemany` batching keep writes fast. The snapshot is replaced
-on each ingest. `daily_counts` accumulates history for incremental passes and is
-replaced for fully read dates. `clusters` is a catalog: a full ingest resets the
-counters of the signatures it reads (idempotent re-ingests), while an incremental
-ingest adds only the delta and keeps `MIN(first_seen)` / `MAX(last_seen)`.
+WAL mode and `executemany` batching keep writes fast. A full rebuild runs as a
+single transaction in `replace_rebuild`: offsets, snapshot, catalog and daily
+counters are cleared and re-inserted together, and `schema_version` is bumped to
+2. Incremental ingests extend the snapshot and add a delta to `clusters` /
+`daily_counts`. Snapshot rows store canonical UTC `first_key`/`last_key`, so
+queries do not re-parse timestamps.
 
 ## Scaling considerations
 
@@ -169,11 +175,13 @@ ingest adds only the delta and keeps `MIN(first_seen)` / `MAX(last_seen)`.
 - LLM explanations are per unique signature. This keeps CPU usage predictable.
 - The parser targets Monolog; unstructured lines are still counted but have no
   context.
-- Rotation during an incremental pass triggers a rebuild of the selected file
-  set. This is more expensive than per-file contribution tracking, but it is
-  simple and correct for all rotation styles.
-- Compressed `*.gz` files are skipped (with a warning). Streaming compressed
-  files would need a different offset model.
+- Rotation during an incremental pass triggers a full rebuild of `log_dir`.
+  This is more expensive than per-file contribution tracking, but it is simple
+  and correct for rename/create rotation and shrinking files.
+- copytruncate with a fast regrow to the previous size can be missed; the
+  documentation states this explicitly rather than overclaiming.
+- Compressed `*.gz` files are skipped (with a warning when the name matches the
+  log patterns). Streaming compressed files would need a different offset model.
 
 ## Possible extensions
 

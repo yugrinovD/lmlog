@@ -5,4 +5,4 @@ number of human-readable signatures, detects errors and anomalies, and can
 explain findings with a local LLM (optional).
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

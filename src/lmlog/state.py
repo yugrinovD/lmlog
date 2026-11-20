@@ -11,6 +11,8 @@ from contextlib import contextmanager
 
 from .parser import ts_sort_key
 
+SCHEMA_VERSION = 2
+
 
 class State:
     def __init__(self, db_path: str):
@@ -49,6 +51,9 @@ class State:
 
     def _init_schema(self) -> None:
         with self.conn() as con:
+            existing_tables = {
+                row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS offsets (
@@ -89,6 +94,8 @@ class State:
                     classes TEXT,
                     first_ts TEXT,
                     last_ts TEXT,
+                    first_key TEXT,
+                    last_key TEXT,
                     sample_message TEXT,
                     sample_raw TEXT,
                     sample_context TEXT,
@@ -115,12 +122,166 @@ class State:
                 """
             )
             self._ensure_column(con, "offsets", "inode", "INTEGER DEFAULT 0")
+            self._ensure_column(con, "snapshot", "first_key", "TEXT")
+            self._ensure_column(con, "snapshot", "last_key", "TEXT")
+
+            if "meta" not in existing_tables:
+                # A freshly created database already has the current schema.
+                con.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            else:
+                row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+                try:
+                    version = int(row["value"]) if row else 0
+                except (TypeError, ValueError):
+                    version = 0
+                if version < SCHEMA_VERSION:
+                    # Legacy 1.0.0 data needs a one-time rebuild before use.
+                    con.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES('rebuild_required', '1')"
+                    )
 
     @staticmethod
     def _ensure_column(con: sqlite3.Connection, table: str, column: str, decl: str) -> None:
         columns = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    def needs_rebuild(self) -> bool:
+        """True when a legacy database or a previous failed rebuild requires it."""
+        with self.conn() as con:
+            row = con.execute("SELECT value FROM meta WHERE key='rebuild_required'").fetchone()
+        return bool(row and row["value"] == "1")
+
+    # --- row builders shared by snapshot/catalog/daily writes ---
+
+    def _snapshot_rows(self, clusters: Iterable, now: str) -> list[tuple]:
+        rows = []
+        for cluster in clusters:
+            cluster.ensure_keys()
+            rows.append(
+                (
+                    cluster.signature,
+                    cluster.count,
+                    json.dumps(dict(cluster.levels), ensure_ascii=False),
+                    json.dumps(dict(cluster.classes), ensure_ascii=False),
+                    cluster.first_ts,
+                    cluster.last_ts,
+                    cluster.first_key,
+                    cluster.last_key,
+                    cluster.sample_message,
+                    cluster.sample_raw,
+                    json.dumps(cluster.sample_context, ensure_ascii=False, default=str),
+                    now,
+                )
+            )
+        return rows
+
+    def _catalog_rows(self, clusters: Iterable) -> list[tuple]:
+        rows = []
+        for cluster in clusters:
+            cluster.ensure_keys()
+            rows.append(
+                (
+                    cluster.signature,
+                    cluster.first_key,
+                    cluster.last_key,
+                    cluster.count,
+                    json.dumps(
+                        {
+                            "levels": dict(cluster.levels),
+                            "classes": dict(
+                                sorted(
+                                    cluster.classes.items(),
+                                    key=lambda kv: kv[1],
+                                    reverse=True,
+                                )[:5]
+                            ),
+                            "sample": cluster.sample_message,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _daily_rows(daily: dict) -> list[tuple]:
+        return [
+            (signature, date, count)
+            for signature, by_date in daily.items()
+            for date, count in by_date.items()
+        ]
+
+    def replace_rebuild(
+        self,
+        offset_rows: Iterable[tuple],
+        snapshot_clusters: Iterable,
+        catalog_clusters: Iterable,
+        daily: dict,
+        period_hours: int | None,
+    ) -> None:
+        """Atomically replace all derived state with a full rebuild."""
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        offsets = list(offset_rows)
+        snapshot_rows = self._snapshot_rows(snapshot_clusters, now)
+        catalog_rows = self._catalog_rows(catalog_clusters)
+        daily_rows = self._daily_rows(daily)
+
+        with self.conn() as con:
+            con.execute("DELETE FROM offsets")
+            con.execute("DELETE FROM snapshot")
+            con.execute("DELETE FROM clusters")
+            con.execute("DELETE FROM daily_counts")
+            if offsets:
+                con.executemany(
+                    """
+                    INSERT INTO offsets(source, size, mtime, lineno, inode)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    offsets,
+                )
+            if snapshot_rows:
+                con.executemany(
+                    """
+                    INSERT INTO snapshot(signature, count, levels, classes, first_ts,
+                                         last_ts, first_key, last_key, sample_message,
+                                         sample_raw, sample_context, created)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    snapshot_rows,
+                )
+            if catalog_rows:
+                con.executemany(
+                    """
+                    INSERT INTO clusters(signature, first_seen, last_seen, total_count, metadata)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    catalog_rows,
+                )
+            if daily_rows:
+                con.executemany(
+                    """
+                    INSERT INTO daily_counts(signature, date, count)
+                    VALUES(?,?,?)
+                    """,
+                    daily_rows,
+                )
+            con.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('snapshot_created', ?)",
+                (now,),
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('snapshot_period_hours', ?)",
+                (str(period_hours) if period_hours else "",),
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            con.execute("DELETE FROM meta WHERE key='rebuild_required'")
 
     # --- offsets / progress ---
 
@@ -149,23 +310,6 @@ class State:
                         row["inode"] or 0,
                     )
         return result
-
-    def prune_offsets(self, log_dir: str, existing: Iterable[str]) -> int:
-        """Remove offsets for files under ``log_dir`` that no longer exist."""
-        base = os.path.abspath(log_dir).rstrip(os.sep) + os.sep
-        keep = set(existing)
-        with self.conn() as con:
-            rows = con.execute("SELECT source FROM offsets").fetchall()
-            stale = [
-                row["source"]
-                for row in rows
-                if row["source"].startswith(base) and row["source"] not in keep
-            ]
-            if stale:
-                con.executemany(
-                    "DELETE FROM offsets WHERE source=?", [(source,) for source in stale]
-                )
-        return len(stale)
 
     def set_offset(self, source: str, size: int, mtime: float, lineno: int, inode: int = 0) -> None:
         with self.conn() as con:
@@ -211,25 +355,7 @@ class State:
         lifetime first/last timestamps. ``mode="full"`` rebuilds the catalog for
         the ingested dataset (idempotent re-ingests).
         """
-        rows = [
-            (
-                c.signature,
-                c.first_key or (ts_sort_key(c.first_ts) if c.first_ts else ""),
-                c.last_key or (ts_sort_key(c.last_ts) if c.last_ts else ""),
-                c.count,
-                json.dumps(
-                    {
-                        "levels": dict(c.levels),
-                        "classes": dict(
-                            sorted(c.classes.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                        ),
-                        "sample": c.sample_message,
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            for c in clusters
-        ]
+        rows = self._catalog_rows(clusters)
         if not rows:
             return
         if mode == "full":
@@ -293,30 +419,16 @@ class State:
 
     def save_snapshot(self, clusters: Iterable, period_hours: int | None) -> None:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        rows = [
-            (
-                c.signature,
-                c.count,
-                json.dumps(dict(c.levels), ensure_ascii=False),
-                json.dumps(dict(c.classes), ensure_ascii=False),
-                c.first_ts,
-                c.last_ts,
-                c.sample_message,
-                c.sample_raw,
-                json.dumps(c.sample_context, ensure_ascii=False, default=str),
-                now,
-            )
-            for c in clusters
-        ]
+        rows = self._snapshot_rows(clusters, now)
         with self.conn() as con:
             con.execute("DELETE FROM snapshot")
             if rows:
                 con.executemany(
                     """
                     INSERT INTO snapshot(signature, count, levels, classes, first_ts,
-                                         last_ts, sample_message, sample_raw,
-                                         sample_context, created)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                                         last_ts, first_key, last_key, sample_message,
+                                         sample_raw, sample_context, created)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     rows,
                 )
@@ -341,8 +453,12 @@ class State:
             cluster.classes.update(json.loads(row["classes"] or "{}"))
             cluster.first_ts = row["first_ts"] or ""
             cluster.last_ts = row["last_ts"] or ""
-            cluster.first_key = ts_sort_key(cluster.first_ts) if cluster.first_ts else ""
-            cluster.last_key = ts_sort_key(cluster.last_ts) if cluster.last_ts else ""
+            cluster.first_key = row["first_key"] or (
+                ts_sort_key(cluster.first_ts) if cluster.first_ts else ""
+            )
+            cluster.last_key = row["last_key"] or (
+                ts_sort_key(cluster.last_ts) if cluster.last_ts else ""
+            )
             cluster.sample_message = row["sample_message"] or ""
             cluster.sample_raw = row["sample_raw"] or ""
             try:
@@ -374,9 +490,7 @@ class State:
         their previous values are deleted before inserting the fresh counts.
         Otherwise counters are added (incremental ingest).
         """
-        rows = [
-            (sig, date, count) for sig, by_date in daily.items() for date, count in by_date.items()
-        ]
+        rows = self._daily_rows(daily)
         with self.conn() as con:
             if replace_dates:
                 marks = ",".join("?" * len(replace_dates))

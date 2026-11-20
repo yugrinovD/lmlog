@@ -131,6 +131,8 @@ def detect_trends(
     """
     import datetime as dt
 
+    if spike_factor <= 0:
+        raise ValueError("spike_factor must be greater than zero")
     if not daily:
         return []
 

@@ -26,3 +26,10 @@ def test_bench_smoke(capsys):
     output = capsys.readouterr().out
     assert "Throughput" in output
     assert "50M lines" in output
+
+
+def test_zero_spike_is_rejected(tmp_path):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(["trends", "--db", str(tmp_path / "state.db"), "--spike", "0"])

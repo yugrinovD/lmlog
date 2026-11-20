@@ -15,15 +15,23 @@ from .ingest import (
     list_log_files,
     merge_result,
     plan_tasks,
-    process_file_into_safe,
+    process_file_local,
     read_journal,
     run_tasks,
+    run_tasks_strict,
 )
 from .state import State
 
 
 def fmt_count(value: int) -> str:
     return f"{value:,}".replace(",", " ")
+
+
+def positive_float(value: str) -> float:
+    number = float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
 
 
 def parse_size(value: str) -> int:
@@ -37,6 +45,29 @@ def parse_size(value: str) -> int:
     return int(text)
 
 
+def _merge_daily(target: dict, source: dict) -> None:
+    for signature, by_date in source.items():
+        destination = target.setdefault(signature, {})
+        for date, count in by_date.items():
+            destination[date] = destination.get(date, 0) + count
+
+
+def _ingest_result(
+    snapshot, files, status, elapsed=0.0, total_lines=0, total_entries=0, findings=None
+):
+    return {
+        "status": status,
+        "elapsed": elapsed,
+        "files": files,
+        "total_entries": total_entries,
+        "total_lines": total_lines,
+        "unique_sigs": len(snapshot.clusters) if snapshot else 0,
+        "findings": findings or [],
+        "clusterer": snapshot,
+        "rate": total_lines / elapsed if elapsed else 0.0,
+    }
+
+
 def run_ingest(
     state: State,
     log_dir: str,
@@ -45,116 +76,127 @@ def run_ingest(
     incremental: bool = False,
     workers: int = 0,
 ) -> dict:
-    """Read logs, cluster signatures and persist a snapshot.
+    """Read logs, cluster signatures and persist state.
 
-    With ``incremental=True`` only new bytes are read and the existing
-    snapshot is extended. If a rotated/truncated file is detected, the selected
-    file set is rebuilt from scratch so counts stay correct.
+    A full ingest is always a rebuild over every file in ``log_dir`` and ignores
+    ``--since``/``--limit``. Incremental ingest reads only new bytes; if a
+    rotation is detected it escalates to a full rebuild.
     """
     all_files = list_log_files(log_dir)
+    legacy_rebuild = state.needs_rebuild()
+    force_rebuild = legacy_rebuild
+    mode = "incremental"
     files = all_files
-    # In incremental mode offsets decide what is new; filtering by mtime could
-    # skip files that still contain unread data after an outage.
-    if since_hours and not incremental:
-        cutoff = time.time() - since_hours * 3600
-        files = [path for path in files if os.path.getmtime(path) >= cutoff]
-    if limit_files:
-        files = files[-limit_files:]
+    tasks: list = []
 
-    if os.path.isdir(log_dir):
-        state.prune_offsets(log_dir, all_files)
+    if incremental and not force_rebuild:
+        if limit_files:
+            files = files[-limit_files:]
+        if not files:
+            print(f"No log files found in {log_dir}; nothing to ingest.")
+            return _ingest_result(state.load_snapshot(), 0, "noop")
+        offsets = state.get_offsets(files)
+        if not any(offsets.get(path, (0, 0.0, 0, 0))[0] for path in files):
+            print(
+                "WARNING: no saved offsets (fresh database?); "
+                "incremental mode will read files from the beginning."
+            )
+        tasks, rotated = plan_tasks(state, files, full=False)
+        if rotated:
+            print("Rotation detected; rebuilding the snapshot from all files.")
+            force_rebuild = True
+    else:
+        force_rebuild = True
 
-    if not files:
-        print(f"No log files found in {log_dir}; nothing to ingest.")
-        snapshot = state.load_snapshot() if incremental else Clusterer()
-        return {
-            "elapsed": 0.0,
-            "files": 0,
-            "total_entries": 0,
-            "total_lines": 0,
-            "unique_sigs": len(snapshot.clusters),
-            "findings": [],
-            "clusterer": snapshot,
-            "rate": 0.0,
-        }
-
-    tasks, rotated = plan_tasks(state, files, full=not incremental)
-    rebuild = bool(incremental and rotated)
-    if rebuild:
-        print("Rotation detected; rebuilding the snapshot from the selected files.")
-        tasks = plan_tasks(state, files, full=True)[0]
-    effective_incremental = incremental and not rebuild
+    if force_rebuild:
+        if not all_files:
+            print(f"No log files found in {log_dir}; the snapshot was left unchanged.")
+            return _ingest_result(state.load_snapshot(), 0, "noop")
+        if legacy_rebuild:
+            print("Legacy database schema detected; rebuilding all files.")
+        mode = "rebuild"
+        files = all_files
+        tasks = plan_tasks(state, all_files, full=True)[0]
 
     known = state.known_signatures()
-    first_run = not known
     started = time.time()
     delta = Clusterer()
     daily: dict = {}
     total_entries = 0
     total_lines = 0
-    offset_rows = []
+    offset_rows: list[tuple] = []
 
-    if workers and workers > 1 and len(tasks) > 1:
-        results = run_tasks(tasks, workers)
-        for (source, cursor), result in results:
-            merge_result(delta, daily, result)
-            total_entries += result["entries"]
-            total_lines += result["lines"]
-            offset_rows.append((source, *cursor))
-    else:
-        for task in tasks:
-            outcome = process_file_into_safe(task, delta, daily)
-            if outcome is None:
-                continue
-            (source, cursor), lines, entries = outcome
-            total_lines += lines
-            total_entries += entries
-            offset_rows.append((source, *cursor))
+    def add_local(cursor, file_clusterer, file_daily, lines, entries) -> None:
+        nonlocal total_lines, total_entries
+        delta.merge(file_clusterer)
+        _merge_daily(daily, file_daily)
+        total_lines += lines
+        total_entries += entries
+        offset_rows.append((cursor[0], *cursor[1]))
+
+    try:
+        if workers and workers > 1 and len(tasks) > 1:
+            results = (
+                run_tasks_strict(tasks, workers) if mode == "rebuild" else run_tasks(tasks, workers)
+            )
+            for (source, cursor), result in results:
+                merge_result(delta, daily, result)
+                total_entries += result["entries"]
+                total_lines += result["lines"]
+                offset_rows.append((source, *cursor))
+        else:
+            for task in tasks:
+                if mode == "rebuild":
+                    cursor, file_clusterer, file_daily, lines, entries = process_file_local(task)
+                else:
+                    try:
+                        cursor, file_clusterer, file_daily, lines, entries = process_file_local(
+                            task
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort incremental
+                        print(f"warning: cannot read {task[0]}: {exc}", file=sys.stderr)
+                        continue
+                add_local(cursor, file_clusterer, file_daily, lines, entries)
+    except Exception as exc:  # noqa: BLE001 - rebuild must not leave partial state
+        print(f"Rebuild failed: {exc}. The existing snapshot was left unchanged.", file=sys.stderr)
+        return _ingest_result(state.load_snapshot(), len(files), "aborted")
 
     if not offset_rows:
         print("No files could be read; the snapshot was left unchanged.")
-        snapshot = state.load_snapshot() if effective_incremental else Clusterer()
-        return {
-            "elapsed": time.time() - started,
-            "files": len(files),
-            "total_entries": 0,
-            "total_lines": 0,
-            "unique_sigs": len(snapshot.clusters),
-            "findings": [],
-            "clusterer": snapshot,
-            "rate": 0.0,
-        }
+        return _ingest_result(state.load_snapshot(), len(files), "noop")
 
-    state.set_offsets(offset_rows)
-    if effective_incremental:
+    if mode == "rebuild":
+        state.replace_rebuild(
+            offset_rows,
+            delta.clusters.values(),
+            delta.clusters.values(),
+            daily,
+            None,
+        )
+        snapshot = delta
+    else:
+        state.set_offsets(offset_rows)
         snapshot = state.load_snapshot()
         snapshot.merge(delta)
-        record_mode = "incremental"
-        replace_dates: set[str] = set()
-    else:
-        snapshot = delta
-        record_mode = "full"
-        replace_dates = {d for by_date in daily.values() for d in by_date}
-    if daily:
-        state.upsert_daily(daily, replace_dates)
+        if daily:
+            state.upsert_daily(daily, set())
+        state.record_clusters(delta.clusters.values(), mode="incremental")
+        state.save_snapshot(snapshot.clusters.values(), since_hours)
 
     findings = detect(list(snapshot.clusters.values()), known)
-    if first_run:
+    if mode == "rebuild" or not known:
         findings = [finding for finding in findings if finding.kind != "new"]
-    state.record_clusters(delta.clusters.values(), mode=record_mode)
-    state.save_snapshot(snapshot.clusters.values(), since_hours)
 
     elapsed = time.time() - started
-    return {
-        "elapsed": elapsed,
-        "files": len(files),
-        "total_entries": total_entries,
-        "total_lines": total_lines,
-        "unique_sigs": len(snapshot.clusters),
-        "findings": findings,
-        "clusterer": snapshot,
-        "rate": total_lines / elapsed if elapsed else 0.0,
-    }
+    return _ingest_result(
+        snapshot,
+        len(files),
+        "ok",
+        elapsed=elapsed,
+        total_lines=total_lines,
+        total_entries=total_entries,
+        findings=findings,
+    )
 
 
 def load_clusters(state: State) -> tuple[Clusterer, str | None]:
@@ -174,7 +216,11 @@ def resolve_clusterer(args, state: State) -> tuple[Clusterer, dict, str | None]:
             incremental=getattr(args, "incremental", False),
             workers=getattr(args, "workers", 0),
         )
-        return result["clusterer"], result, None
+        clusterer = result["clusterer"]
+        if result["status"] != "ok":
+            findings = detect(list(clusterer.clusters.values()), state.known_signatures())
+            return clusterer, {"findings": findings, "clusterer": clusterer}, None
+        return clusterer, result, None
     clusterer, created = load_clusters(state)
     if not clusterer.clusters:
         print("Snapshot is empty. Run `lmlog ingest` first (or pass --live).")
@@ -256,6 +302,11 @@ def cmd_ingest(args) -> int:
         incremental=args.incremental,
         workers=args.workers,
     )
+    if result["status"] != "ok":
+        if result["status"] == "aborted":
+            print("Ingest aborted; the existing snapshot was left unchanged.")
+            return 1
+        return 0
     print(
         f"Ingest finished: files={result['files']}, lines={fmt_count(result['total_lines'])}, "
         f"entries={fmt_count(result['total_entries'])}, signatures={result['unique_sigs']}, "
@@ -389,6 +440,8 @@ def cmd_trends(args) -> int:
         )
         clusterer = result["clusterer"]
         created = None
+        if result["status"] == "aborted":
+            print("Ingest failed; showing trends from the existing snapshot.")
     else:
         clusterer, created = load_clusters(state)
     daily = state.load_daily()
@@ -576,9 +629,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--db", default=None, help="SQLite state path (default: $LMLOG_DB or ~/.lmlog/lmlog.db)"
     )
     common.add_argument(
-        "--since", type=int, default=None, help="only files modified in the last N hours"
+        "--since",
+        type=int,
+        default=None,
+        help="metadata hint; full ingest always rebuilds all files",
     )
-    common.add_argument("--limit", type=int, default=None, help="read only the last N files")
+    common.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="incremental only: read at most the last N files",
+    )
     common.add_argument(
         "--live", action="store_true", help="read log files now instead of using the snapshot"
     )
@@ -650,7 +711,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trends.add_argument("-n", type=int, default=15)
     trends.add_argument(
-        "--spike", type=float, default=3.0, help="anomaly threshold versus the median"
+        "--spike",
+        type=positive_float,
+        default=3.0,
+        help="anomaly threshold versus the median (must be > 0)",
     )
     trends.add_argument(
         "--explain", action="store_true", help="explain trends with the LLM (or heuristic)"

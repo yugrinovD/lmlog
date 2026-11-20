@@ -193,7 +193,7 @@ def test_offset_keys_are_absolute(tmp_path, monkeypatch):
     assert state.get_offset(str(path))[0] > 0
 
 
-def test_deleted_file_offsets_are_pruned(tmp_path):
+def test_missing_file_keeps_offset_in_incremental(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
     first = logs / "console-2026-08-24.log"
@@ -205,8 +205,30 @@ def test_deleted_file_offsets_are_pruned(tmp_path):
 
     second.unlink()
     run_ingest(state, str(logs), None, None, incremental=True)
+    assert state.get_offset(str(second))[0] > 0
+
+    run_ingest(state, str(logs), None, None)
     assert state.get_offset(str(second))[0] == 0
     assert state.get_offset(str(first))[0] > 0
+
+
+def test_temporarily_missing_file_is_not_double_counted(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    path = logs / "console-2026-08-25.log"
+    write_log(path, [log_line("2026-08-25T10:00:00+00:00", "INFO", "one")])
+    state = State(str(tmp_path / "state.db"))
+    run_ingest(state, str(logs), None, None)
+    before = sum(c.count for c in state.load_snapshot().clusters.values())
+
+    backup = logs / "console-2026-08-25.log.bak"
+    path.rename(backup)
+    run_ingest(state, str(logs), None, None, incremental=True)
+    backup.rename(path)
+    result = run_ingest(state, str(logs), None, None, incremental=True)
+
+    assert result["total_lines"] == 0
+    assert sum(c.count for c in state.load_snapshot().clusters.values()) == before
 
 
 def test_gz_files_are_skipped_with_warning(tmp_path, capsys):
@@ -222,3 +244,115 @@ def test_gz_files_are_skipped_with_warning(tmp_path, capsys):
     files = ingest.list_log_files(str(logs))
     assert len(files) == 1
     assert "skipping *.gz" in capsys.readouterr().err
+
+
+def test_full_ingest_ignores_filters(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    write_log(
+        logs / "console-2026-08-24.log", [log_line("2026-08-24T10:00:00+00:00", "INFO", "one")]
+    )
+    write_log(
+        logs / "console-2026-08-25.log", [log_line("2026-08-25T10:00:00+00:00", "INFO", "two")]
+    )
+    state = State(str(tmp_path / "state.db"))
+
+    result = run_ingest(state, str(logs), since_hours=1, limit_files=1)
+    assert result["status"] == "ok"
+    assert result["files"] == 2
+    assert sum(cluster.count for cluster in state.load_snapshot().clusters.values()) == 2
+
+
+def test_incremental_partial_failure_does_not_commit_prefix(tmp_path, monkeypatch):
+    import lmlog.ingest as ingest
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    path = logs / "console-2026-08-25.log"
+    write_log(path, [log_line("2026-08-25T10:00:00+00:00", "INFO", "one")])
+    state = State(str(tmp_path / "state.db"))
+    run_ingest(state, str(logs), None, None)
+
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(log_line("2026-08-25T11:00:00+00:00", "INFO", "two"))
+        fh.write(log_line("2026-08-25T11:00:01+00:00", "INFO", "three"))
+
+    original = ingest.build_signature
+
+    def boom(_entry):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ingest, "build_signature", boom)
+    result = run_ingest(state, str(logs), None, None, incremental=True)
+    assert result["status"] == "noop"
+    assert sum(cluster.count for cluster in state.load_snapshot().clusters.values()) == 1
+
+    monkeypatch.setattr(ingest, "build_signature", original)
+    result = run_ingest(state, str(logs), None, None, incremental=True)
+    assert result["total_lines"] == 2
+    assert sum(cluster.count for cluster in state.load_snapshot().clusters.values()) == 3
+
+
+def test_rebuild_failure_leaves_snapshot_unchanged(tmp_path, monkeypatch):
+    import lmlog.ingest as ingest
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    path = logs / "console-2026-08-25.log"
+    write_log(path, [log_line("2026-08-25T10:00:00+00:00", "INFO", "one")])
+    state = State(str(tmp_path / "state.db"))
+    run_ingest(state, str(logs), None, None)
+
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(log_line("2026-08-25T11:00:00+00:00", "INFO", "two"))
+        fh.write(log_line("2026-08-25T11:00:01+00:00", "INFO", "three"))
+
+    original = ingest.build_signature
+
+    def boom(_entry):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ingest, "build_signature", boom)
+    result = run_ingest(state, str(logs), None, None)
+    assert result["status"] == "aborted"
+    assert sum(cluster.count for cluster in state.load_snapshot().clusters.values()) == 1
+
+    monkeypatch.setattr(ingest, "build_signature", original)
+    result = run_ingest(state, str(logs), None, None)
+    assert result["status"] == "ok"
+    assert sum(cluster.count for cluster in state.load_snapshot().clusters.values()) == 3
+
+
+def test_full_rebuild_removes_missing_signatures_and_dates(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    old = logs / "console-2026-08-24.log"
+    new = logs / "console-2026-08-25.log"
+    write_log(old, [log_line("2026-08-24T10:00:00+00:00", "INFO", "alpha")])
+    write_log(new, [log_line("2026-08-25T10:00:00+00:00", "INFO", "beta")])
+    state = State(str(tmp_path / "state.db"))
+    run_ingest(state, str(logs), None, None)
+
+    old.unlink()
+    run_ingest(state, str(logs), None, None)
+    with state.conn() as con:
+        signatures = {row[0] for row in con.execute("SELECT signature FROM clusters")}
+        dates = {row[0] for row in con.execute("SELECT DISTINCT date FROM daily_counts")}
+    assert not any("alpha" in signature for signature in signatures)
+    assert any("beta" in signature for signature in signatures)
+    assert dates == {"2026-08-25"}
+
+
+def test_irrelevant_gz_does_not_warn(tmp_path, capsys):
+    import lmlog.ingest as ingest
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    write_log(
+        logs / "console-2026-08-25.log", [log_line("2026-08-25T10:00:00+00:00", "INFO", "one")]
+    )
+    (logs / "notes.txt.gz").write_bytes(b"compressed")
+    ingest._gz_warned = False
+    files = ingest.list_log_files(str(logs))
+    assert len(files) == 1
+    assert "skipping" not in capsys.readouterr().err

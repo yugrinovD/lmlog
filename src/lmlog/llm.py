@@ -85,6 +85,11 @@ class OllamaClient:
         return self._health
 
 
+def _escape_prompt_data(value: object) -> str:
+    """Prevent log content from closing the <log_event> data block."""
+    return str(value).replace("<", "&lt;").replace(">", "&gt;")
+
+
 def build_prompt(
     level: str,
     message: str,
@@ -94,12 +99,13 @@ def build_prompt(
     period: str,
     errors: int,
 ) -> str:
+    context_text = json.dumps(context, ensure_ascii=False)[:1500] if context else "{}"
     return PROMPT_TEMPLATE.format(
-        level=level or "-",
-        message=message or "-",
-        klass=klass or "-",
-        context=json.dumps(context, ensure_ascii=False)[:1500] if context else "{}",
+        level=_escape_prompt_data(level or "-"),
+        message=_escape_prompt_data(message or "-"),
+        klass=_escape_prompt_data(klass or "-"),
+        context=_escape_prompt_data(context_text),
         count=count,
-        period=period or "-",
+        period=_escape_prompt_data(period or "-"),
         errors=errors,
     )

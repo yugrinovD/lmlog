@@ -106,7 +106,7 @@ def test_catalog_first_and_last_use_utc_min_max(tmp_path):
     assert row["last_seen"] == "2026-08-25T10:00:00+00:00"
 
 
-def test_batch_offsets_and_pruning(tmp_path):
+def test_batch_offsets(tmp_path):
     state = State(str(tmp_path / "state.db"))
     state.set_offsets(
         [
@@ -117,9 +117,25 @@ def test_batch_offsets_and_pruning(tmp_path):
     )
     offsets = state.get_offsets(["/data/logs/a.log", "/data/logs/b.log", "/missing"])
     assert offsets["/data/logs/a.log"] == (1, 1.0, 1, 1)
+    assert offsets["/data/logs/b.log"] == (2, 2.0, 2, 2)
     assert "/missing" not in offsets
 
-    removed = state.prune_offsets("/data/logs", ["/data/logs/a.log"])
-    assert removed == 1
-    assert state.get_offset("/data/logs/b.log") == (0, 0.0, 0, 0)
-    assert state.get_offset("/other/c.log")[0] == 3
+
+def test_snapshot_keys_are_persisted(tmp_path, monkeypatch):
+    state = State(str(tmp_path / "state.db"))
+    cluster = make_cluster(
+        "sig",
+        3,
+        "2026-08-25T11:00:00+03:00",
+        "2026-08-25T12:00:00+03:00",
+    )
+    state.save_snapshot([cluster], 24)
+
+    def fail(_ts):
+        raise AssertionError("ts_sort_key must not be called when keys are stored")
+
+    monkeypatch.setattr("lmlog.state.ts_sort_key", fail)
+    loaded = state.load_snapshot()
+    restored = loaded.clusters["sig"]
+    assert restored.first_key == "2026-08-25T08:00:00+00:00"
+    assert restored.last_key == "2026-08-25T09:00:00+00:00"

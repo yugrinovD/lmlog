@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmlog"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local, CPU-first log intelligence: signatures, errors, trends and explanations for very large log volumes."
 readme = "README.md"
 requires-python = ">=3.10"
