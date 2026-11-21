@@ -7,9 +7,9 @@ import os
 import sys
 
 from . import __version__
-from .config import default_db, default_log_dir, default_model
+from .config import default_db, default_log_dir, default_model, llm_mode
 from .detect import detect_trends
-from .llm import OllamaClient
+from .llm import create_client
 
 _COLORS = {
     "reset": "\033[0m",
@@ -59,13 +59,18 @@ def diag(state, args) -> dict:
     daily = state.load_daily()
     days = len({d for by_date in daily.values() for d in by_date}) if daily else 0
     daemon = daemon_status(_db_path(args))
+    client = create_client(model=getattr(args, "model", default_model()))
     info = {
         "snapshot_created": created,
         "snapshot_period": period,
         "days_history": days,
         "daemon_running": daemon["running"],
         "daemon_pid": daemon["pid"],
-        "ollama": OllamaClient().health(),
+        "llm": {
+            "mode": llm_mode(),
+            "provider": client.label,
+            "available": client.health(),
+        },
         "cluster_count": 0,
         "model": getattr(args, "model", default_model()),
     }
@@ -97,11 +102,19 @@ def print_diag(info: dict) -> None:
         print(c("[ok] trend history: ", "green") + f"{info['days_history']} day(s)")
     else:
         print(c("[!] no trend history yet - it accumulates after ingest", "yellow"))
-    if info["ollama"]:
-        print(c("[ok] local LLM (Ollama): available", "green") + f", model {info['model']}")
+    llm = info["llm"]
+    if llm["available"]:
+        print(
+            c(f"[ok] LLM ({llm['provider']}, {llm['mode']}): available", "green")
+            + f", model {info['model']}"
+        )
     else:
         print(
-            c("[!] local LLM (Ollama): unavailable - heuristic explanations will be used", "yellow")
+            c(
+                f"[!] LLM ({llm['provider']}, {llm['mode']}): unavailable"
+                " - heuristic explanations will be used",
+                "yellow",
+            )
         )
     print()
 
@@ -222,14 +235,14 @@ def cmd_summary(args) -> int:
 
 def _run_explain(state, args, findings) -> None:
     from .explain import choose_explanation
-    from .llm import OllamaClient
+    from .llm import create_client
 
-    client = OllamaClient(
+    client = create_client(
         model=getattr(args, "model", default_model()), timeout=getattr(args, "timeout", 120)
     )
     use_llm = client.health()
     if not use_llm:
-        print(c("Ollama is unavailable - using heuristic explanations.", "yellow"))
+        print(c(f"{client.label} is unavailable - using heuristic explanations.", "yellow"))
     print()
     for index, finding in enumerate(findings, 1):
         print(c(f"[{index}/{len(findings)}] explanation:", "bold"))
@@ -370,7 +383,8 @@ Commands:
 Tips:
   * Run `lmlog ingest` once; every query after that is instant.
   * `lmlog daemon` keeps the snapshot fresh every 5 minutes.
-  * AI explanations need Ollama; without it heuristic explanations are used.
+  * AI explanations use gogate (default) or direct Ollama in standalone mode;
+    without either, heuristic explanations are used.
   * State is stored in $LMLOG_DB (default: ~/.lmlog/lmlog.db).
 """
     )

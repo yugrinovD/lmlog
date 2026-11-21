@@ -11,6 +11,7 @@ def test_wizard_non_tty_summarizes_and_ingests(tmp_path, monkeypatch, capsys):
     )
     db = str(tmp_path / "state.db")
 
+    monkeypatch.setenv("LMLOG_LLM_MODE", "direct")
     monkeypatch.setattr("lmlog.llm.OllamaClient.health", lambda self, force=False: False)
     args = argparse.Namespace(
         log_dir=str(logs),

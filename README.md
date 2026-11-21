@@ -36,10 +36,13 @@
 - **Параллельный парсинг** — `--workers N` для нескольких файлов/ядер.
 - **Детекция** — ERROR-кластеры, новые сигнатуры, частый шум, всплески, спады.
 - **Тренды по дням** — `daily_counts` в SQLite, медианная базовая линия.
-- **Локальная LLM** — Ollama (CPU), кэш объяснений в SQLite; при недоступности
-  модели автоматически используется эвристика.
+- **LLM через gateway** — по умолчанию `lmlog` ходит в `gogate` по
+  OpenAI-совместимому API; standalone-режим `direct` оставляет прямую работу с
+  Ollama. Кэш объяснений хранится в SQLite, при недоступности LLM автоматически
+  используется эвристика.
 - **Генератор логов** — реалистичный синтетический поток для демо и бенчмарков.
-- **Docker + Compose** — генератор, CLI, демон и опциональный Ollama-профиль.
+- **Docker + Compose** — генератор, CLI, демон и опциональный standalone
+  Ollama-профиль `ai`.
 - **Ноль обязательных зависимостей** — только стандартная библиотека Python;
   `orjson` подхватывается автоматически, если установлен.
 
@@ -56,7 +59,9 @@ flowchart LR
     F --> H[Trends: spikes / drops / new]
     G --> I{Explain}
     H --> I
-    I -->|available| J[Local LLM via Ollama]
+    I -->|gateway| J[gogate :8080]
+    J --> O[(Ollama, shared infra)]
+    I -->|direct, standalone| O
     I -->|fallback| K[Heuristic rules]
 ```
 
@@ -86,7 +91,8 @@ make explain      # объяснения (эвристика, LLM не нужн�
 make trends       # аномалии по истории
 make daemon-up    # фоновый инкрементальный ingest
 make bench        # замер пропускной способности
-make llm          # поднять Ollama и скачать модель
+make ai-up        # standalone-dev: поднять Ollama и скачать модель
+make pull-model   # только скачать модель
 make down         # остановить сервисы
 ```
 
@@ -156,7 +162,8 @@ errors=410  total=410  first=2026-08-25T00:02:35  last=2026-08-25T23:53:49
 3. **Разбор**: `lmlog scan` и `lmlog errors` — ошибки, новые шаблоны, шум.
 4. **Тренды**: `lmlog trends` — всплески, «замолчавшие» паттерны, новые шаблоны.
 5. **Explain**: `lmlog explain --no-llm` — структурированные эвристики;
-   с `make llm` и `lmlog explain` — объяснения локальной модели.
+   с `make ai-up` и `LMLOG_LLM_MODE=direct` — объяснения локальной модели,
+   в полном стеке — через `gogate`.
 6. **Daemon**: `make daemon-up` — фоновое обновление снимка каждые 5 минут.
 7. **Benchmark**: `lmlog bench --lines 1000000` — пропускная способность.
 
@@ -174,10 +181,56 @@ errors=410  total=410  first=2026-08-25T00:02:35  last=2026-08-25T23:53:49
 | `lmlog trends` | Проактивные тренды по истории дней |
 | `lmlog status` / `summary` | Текущая ситуация |
 | `lmlog daemon` | Фоновый инкрементальный ingest |
+| `lmlog serve` | HTTP API (нужен extra `serve` и токен) |
 | `lmlog bench` | Замер пропускной способности |
 | `lmlog journal` | Системный журнал (если доступен journalctl) |
 
 Полная справка: `lmlog <command> --help`.
+
+## HTTP API: `lmlog serve`
+
+Для веб-консоли есть опциональный режим HTTP API. Он не входит в базовую установку:
+
+```bash
+pip install -e ".[serve]"
+export LMLOG_API_TOKEN="$(openssl rand -hex 32)"
+lmlog serve --host 127.0.0.1 --port 8090
+```
+
+Docker:
+
+```bash
+LMLOG_API_TOKEN="$(openssl rand -hex 32)" make serve
+```
+
+API защищён `Authorization: Bearer ${LMLOG_API_TOKEN}` (constant-time сравнение).
+Токен обязателен: без него сервис не стартует.
+
+| Метод | Путь | Назначение |
+| --- | --- | --- |
+| `POST` | `/api/v1/jobs` | загрузить `.log/.txt/.jsonl` (≤ 50 МБ) и запустить ingest |
+| `GET` | `/api/v1/jobs` | последние задания |
+| `GET` | `/api/v1/jobs/{id}` | статус и статистика задания |
+| `GET` | `/api/v1/jobs/{id}/events` | SSE-прогресс с `Last-Event-ID` |
+| `GET` | `/api/v1/snapshots/{id}/summary` | сводка снимка |
+| `GET` | `/api/v1/snapshots/{id}/signatures` | сигнатуры с фильтрами и пагинацией |
+| `GET` | `/api/v1/snapshots/{id}/errors` | ERROR/CRITICAL-кластеры |
+| `GET` | `/api/v1/snapshots/{id}/trends` | всплески, спады и новые шаблоны |
+| `POST` | `/api/v1/explain` | объяснение кластера (LLM или эвристика) |
+| `POST` | `/api/v1/chat` | вопрос по снимку: top-N сигнатур + выбранный кластер |
+| `GET` | `/healthz` | liveness без авторизации, режим и модель LLM |
+
+Ограничения режима `serve`:
+
+- задания и SSE-очереди живут в памяти процесса; запускайте один uvicorn-worker;
+- загруженные файлы и SQLite-снимки хранятся в `LMLOG_SERVE_DATA_DIR`
+  (по умолчанию `~/.lmlog/serve`);
+- чат не использует RAG/эмбеддинги: модель видит только сводку, top-N сигнатур,
+  выбранный кластер и последние тренды;
+- при недоступном `gogate` (или Ollama за ним) объяснения и чат переключаются на
+  детерминированную эвристику; ingest/scan/trends продолжают работать;
+- имена файлов санитизируются, на диск всегда пишется сгенерированное имя;
+- лимит загрузки по умолчанию 50 МБ, расширения — `.log`, `.txt`, `.jsonl`.
 
 ## Корректность данных
 
@@ -232,20 +285,41 @@ Throughput      : ~85 000 lines/s
 Файлы по умолчанию: `console-*.log`, `prod-*.log`, `courses_console-*.log`, `*.log`.
 Каталог задаётся через `--log-dir` или `LMLOG_LOG_DIR`.
 
-## Локальная LLM
+## LLM: gateway и direct
 
-`lmlog explain` сначала пытается обратиться к Ollama, а при недоступности
-переключается на эвристические объяснения — демо работает всегда.
+`lmlog` не владеет LLM-инфраструктурой. По умолчанию он вызывает `gogate` по
+OpenAI-совместимому API (`/v1/chat/completions`), а `gogate` уже ходит в Ollama.
+Это даёт единые retry/таймауты/лимиты/кэш/метрики на весь AI-трафик.
+
+```dotenv
+# Полный стек (рекомендуется)
+LMLOG_LLM_MODE=gateway
+GOGATE_BASE_URL=http://gogate:8080
+GOGATE_API_KEY=<ключ из gogate>
+
+# Standalone-разработка без gogate
+LMLOG_LLM_MODE=direct
+OLLAMA_HOST=ollama:11434
+```
 
 ```bash
-make llm                     # docker compose profile llm + ollama pull
-lmlog explain                # LLM, если доступна
+make ai-up                   # standalone-dev: profile ai + ollama pull
+LMLOG_LLM_MODE=direct lmlog explain
+lmlog explain                # gateway по умолчанию
 lmlog explain --no-llm       # только эвристика
 lmlog explain --refresh      # игнорировать кэш
 ```
 
-Настройки: `OLLAMA_HOST` (по умолчанию `127.0.0.1:11434`), `LMLOG_MODEL`
-(по умолчанию `qwen2.5:3b`). Объяснения кэшируются по сигнатуре в SQLite.
+При недоступном gateway или модели `lmlog` возвращает `source=heuristic` и не
+ломает ingest/scan/trends. Объяснения кэшируются по сигнатуре в SQLite.
+
+> **Migration note:** раньше `lmlog` по умолчанию ходил в Ollama напрямую.
+> Теперь default — `gateway`. Для старого поведения задайте
+> `LMLOG_LLM_MODE=direct` (standalone compose делает это автоматически).
+
+> Standalone-профиль `ai` и полный стек взаимоисключающие: не запускайте два
+> Ollama одновременно — это двойной расход RAM и конфликт порта `11434`.
+> В полном стеке используйте `infra/`.
 
 ## Конфигурация
 
@@ -254,8 +328,12 @@ lmlog explain --refresh      # игнорировать кэш
 | `LMLOG_HOME` | `~/.lmlog` | Каталог состояния (daemon pid/log) |
 | `LMLOG_DB` | `$LMLOG_HOME/lmlog.db` | Путь к SQLite |
 | `LMLOG_LOG_DIR` | `data/logs` | Каталог логов |
-| `LMLOG_MODEL` | `qwen2.5:3b` | Модель Ollama |
-| `OLLAMA_HOST` | `127.0.0.1:11434` | Адрес Ollama |
+| `LMLOG_LLM_MODE` | `gateway` | `gateway` (gogate) или `direct` (Ollama) |
+| `LMLOG_MODEL` | `qwen2.5:3b` | Модель в gateway или Ollama |
+| `GOGATE_BASE_URL` | `http://127.0.0.1:8080` | Public listener gogate |
+| `GOGATE_API_KEY` | — | API-ключ для gateway |
+| `GOGATE_API_KEY_FILE` | — | Файл с ключом (Docker secrets) |
+| `OLLAMA_HOST` | `127.0.0.1:11434` | Адрес Ollama, только в `direct` |
 | `NO_COLOR` | — | Отключить ANSI-цвета |
 
 ## Разработка
@@ -280,10 +358,11 @@ src/lmlog/
   state.py       # SQLite: offsets, снимок, история, кэш
   detect.py      # ошибки, новые шаблоны, тренды
   explain.py     # эвристические объяснения
-  llm.py         # клиент Ollama
+  llm.py         # клиенты gogate (gateway) и Ollama (direct)
   generator.py   # генератор синтетических логов
   config.py      # конфигурация и env
   cli.py         # CLI
+  serve/         # optional FastAPI HTTP API
   wizard.py      # интерактивный режим
   daemon.py      # фоновое обновление
 tests/           # pytest
@@ -295,8 +374,8 @@ examples/        # пример лога
 - Ориентирован на структурированные Monolog-логи; произвольный текст
   обрабатывается как сообщение без контекста.
 - journald доступен только там, где есть `journalctl` (в контейнере — опционально).
-- Локальная LLM на CPU объясняет десятки уникальных шаблонов, а не поток строк —
-  это осознанное архитектурное решение.
+- LLM объясняет десятки уникальных шаблонов, а не поток строк — это осознанное
+  архитектурное решение. В полном стеке LLM-вызовы идут только через `gogate`.
 - SQLite — единая точка состояния; для одного хоста и одного набора логов этого
   достаточно.
 - При ротации/усечении в incremental-режиме выполняется пересборка всех файлов

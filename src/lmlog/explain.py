@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from .llm import OllamaClient, build_prompt
+from .llm import LLMClient, build_prompt, create_client
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
@@ -177,13 +177,13 @@ def heuristic_explain(finding) -> str:
 
 def choose_explanation(
     finding,
-    client: OllamaClient | None = None,
+    client: LLMClient | None = None,
     use_llm: bool = True,
     period: str = "",
 ) -> tuple[str, str]:
     """Return ``(text, source)`` where source is ``llm`` or ``heuristic``."""
     if use_llm:
-        client = client or OllamaClient()
+        client = client or create_client()
         if client.health():
             prompt = build_prompt(
                 level="ERROR" if getattr(finding, "errors", 0) else "INFO",

@@ -40,10 +40,13 @@ grepping through gigabytes of files does not scale.
 - **Detection** — error clusters, new signatures, high-volume noise, spikes and
   drops.
 - **Daily trends** — `daily_counts` in SQLite with a median baseline.
-- **Local LLM** — Ollama (CPU), explanation cache in SQLite; if the model is
-  unavailable, heuristics are used automatically.
+- **LLM through a gateway** — by default `lmlog` calls `gogate` over the
+  OpenAI-compatible API; the standalone `direct` mode keeps native Ollama
+  access. Explanations are cached in SQLite and fall back to heuristics when no
+  LLM is available.
 - **Log generator** — realistic synthetic stream for demos and benchmarks.
-- **Docker + Compose** — generator, CLI, daemon and an optional Ollama profile.
+- **Docker + Compose** — generator, CLI, daemon and an optional standalone
+  Ollama `ai` profile.
 - **Zero mandatory dependencies** — standard library only; `orjson` is picked up
   automatically if installed.
 
@@ -60,7 +63,9 @@ flowchart LR
     F --> H[Trends: spikes / drops / new]
     G --> I{Explain}
     H --> I
-    I -->|available| J[Local LLM via Ollama]
+    I -->|gateway| J[gogate :8080]
+    J --> O[(Ollama, shared infra)]
+    I -->|direct, standalone| O
     I -->|fallback| K[Heuristic rules]
 ```
 
@@ -90,7 +95,8 @@ make explain      # explanations (heuristic, no LLM required)
 make trends       # anomalies from history
 make daemon-up    # background incremental ingest
 make bench        # measure throughput
-make llm          # start Ollama and pull the model
+make ai-up        # standalone-dev: start Ollama and pull the model
+make pull-model   # pull the model only
 make down         # stop services
 ```
 
@@ -160,7 +166,8 @@ errors=410  total=410  first=2026-08-25T00:02:35  last=2026-08-25T23:53:49
 3. **Triage**: `lmlog scan` and `lmlog errors` — errors, new patterns, noise.
 4. **Trends**: `lmlog trends` — spikes, silent patterns, new templates.
 5. **Explain**: `lmlog explain --no-llm` — structured heuristics; with
-   `make llm` and `lmlog explain` — local model explanations.
+   `make ai-up` and `LMLOG_LLM_MODE=direct` — local model explanations; in the
+   full stack — through `gogate`.
 6. **Daemon**: `make daemon-up` — background refresh every 5 minutes.
 7. **Benchmark**: `lmlog bench --lines 1000000` — throughput.
 
@@ -178,10 +185,56 @@ errors=410  total=410  first=2026-08-25T00:02:35  last=2026-08-25T23:53:49
 | `lmlog trends` | Proactive trends from daily history |
 | `lmlog status` / `summary` | Current situation |
 | `lmlog daemon` | Background incremental ingest |
+| `lmlog serve` | HTTP API (requires the `serve` extra and a token) |
 | `lmlog bench` | Throughput measurement |
 | `lmlog journal` | System journal (if `journalctl` is available) |
 
 Full help: `lmlog <command> --help`.
+
+## HTTP API: `lmlog serve`
+
+For web consoles there is an optional HTTP mode. It is not part of the default install:
+
+```bash
+pip install -e ".[serve]"
+export LMLOG_API_TOKEN="$(openssl rand -hex 32)"
+lmlog serve --host 127.0.0.1 --port 8090
+```
+
+Docker:
+
+```bash
+LMLOG_API_TOKEN="$(openssl rand -hex 32)" make serve
+```
+
+The API requires `Authorization: Bearer ${LMLOG_API_TOKEN}` (constant-time comparison).
+The token is mandatory; the service refuses to start without it.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/v1/jobs` | upload `.log/.txt/.jsonl` (≤ 50 MiB) and start ingest |
+| `GET` | `/api/v1/jobs` | recent jobs |
+| `GET` | `/api/v1/jobs/{id}` | job status and statistics |
+| `GET` | `/api/v1/jobs/{id}/events` | SSE progress with `Last-Event-ID` |
+| `GET` | `/api/v1/snapshots/{id}/summary` | snapshot overview |
+| `GET` | `/api/v1/snapshots/{id}/signatures` | signatures with filters and pagination |
+| `GET` | `/api/v1/snapshots/{id}/errors` | ERROR/CRITICAL clusters |
+| `GET` | `/api/v1/snapshots/{id}/trends` | spikes, drops and new patterns |
+| `POST` | `/api/v1/explain` | explain a cluster (LLM or heuristic) |
+| `POST` | `/api/v1/chat` | ask about a snapshot: top-N signatures + selected cluster |
+| `GET` | `/healthz` | liveness without auth, LLM mode and model |
+
+`serve` limitations:
+
+- jobs and SSE subscribers live in process memory; run a single uvicorn worker;
+- uploads and SQLite snapshots are stored in `LMLOG_SERVE_DATA_DIR`
+  (default `~/.lmlog/serve`);
+- chat is not RAG: the model only sees the summary, top-N signatures, the selected
+  cluster and the latest trends;
+- when `gogate` (or Ollama behind it) is unavailable, explanations and chat fall
+  back to deterministic heuristics; ingest/scan/trends keep working;
+- filenames are sanitised and storage always uses a generated name;
+- the upload limit is 50 MiB by default; allowed extensions are `.log`, `.txt` and `.jsonl`.
 
 ## Data correctness
 
@@ -237,20 +290,43 @@ Symfony/Monolog is supported:
 Default file patterns: `console-*.log`, `prod-*.log`, `courses_console-*.log`,
 `*.log`. The directory is set with `--log-dir` or `LMLOG_LOG_DIR`.
 
-## Local LLM
+## LLM: gateway and direct
 
-`lmlog explain` first tries Ollama and falls back to heuristic explanations when
-the model is unavailable, so the demo always works.
+`lmlog` does not own the LLM infrastructure. By default it calls `gogate` over
+the OpenAI-compatible API (`/v1/chat/completions`), and `gogate` talks to
+Ollama. This keeps retries, timeouts, limits, cache, metrics and cost in one
+place.
+
+```dotenv
+# Full stack (recommended)
+LMLOG_LLM_MODE=gateway
+GOGATE_BASE_URL=http://gogate:8080
+GOGATE_API_KEY=<key created in gogate>
+
+# Standalone development without gogate
+LMLOG_LLM_MODE=direct
+OLLAMA_HOST=ollama:11434
+```
 
 ```bash
-make llm                     # docker compose profile llm + ollama pull
-lmlog explain                # LLM if available
+make ai-up                   # standalone-dev: profile ai + ollama pull
+LMLOG_LLM_MODE=direct lmlog explain
+lmlog explain                # gateway by default
 lmlog explain --no-llm       # heuristics only
 lmlog explain --refresh      # ignore the cache
 ```
 
-Settings: `OLLAMA_HOST` (default `127.0.0.1:11434`), `LMLOG_MODEL` (default
-`qwen2.5:3b`). Explanations are cached per signature in SQLite.
+When the gateway or the model is unavailable, `lmlog` returns
+`source=heuristic` and keeps ingest/scan/trends working. Explanations are
+cached per signature in SQLite.
+
+> **Migration note:** `lmlog` used to call Ollama directly by default. The new
+> default is `gateway`. Set `LMLOG_LLM_MODE=direct` for the old behaviour (the
+> standalone Compose file does this automatically).
+
+> The standalone `ai` profile and the full stack are mutually exclusive: do not
+> run two Ollama containers at once (double RAM and a `11434` port conflict).
+> Use `infra/` for the full stack.
 
 ## Configuration
 
@@ -259,8 +335,12 @@ Settings: `OLLAMA_HOST` (default `127.0.0.1:11434`), `LMLOG_MODEL` (default
 | `LMLOG_HOME` | `~/.lmlog` | State directory (daemon pid/log) |
 | `LMLOG_DB` | `$LMLOG_HOME/lmlog.db` | SQLite path |
 | `LMLOG_LOG_DIR` | `data/logs` | Log directory |
-| `LMLOG_MODEL` | `qwen2.5:3b` | Ollama model |
-| `OLLAMA_HOST` | `127.0.0.1:11434` | Ollama endpoint |
+| `LMLOG_LLM_MODE` | `gateway` | `gateway` (gogate) or `direct` (Ollama) |
+| `LMLOG_MODEL` | `qwen2.5:3b` | Model in the gateway or Ollama |
+| `GOGATE_BASE_URL` | `http://127.0.0.1:8080` | gogate public listener |
+| `GOGATE_API_KEY` | — | Gateway API key |
+| `GOGATE_API_KEY_FILE` | — | Key file (Docker secrets) |
+| `OLLAMA_HOST` | `127.0.0.1:11434` | Ollama endpoint, `direct` only |
 | `NO_COLOR` | — | Disable ANSI colours |
 
 ## Development
@@ -285,10 +365,11 @@ src/lmlog/
   state.py       # SQLite: offsets, snapshot, history, cache
   detect.py      # errors, new patterns, trends
   explain.py     # heuristic explanations
-  llm.py         # Ollama client
+  llm.py         # gogate (gateway) and Ollama (direct) clients
   generator.py   # synthetic log generator
   config.py      # configuration and environment
   cli.py         # command line interface
+  serve/         # optional FastAPI HTTP API
   wizard.py      # interactive mode
   daemon.py      # background refresh
 tests/           # pytest

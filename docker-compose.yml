@@ -27,8 +27,9 @@ services:
     environment:
       LMLOG_DB: /state/lmlog.db
       LMLOG_LOG_DIR: /data/logs
+      LMLOG_LLM_MODE: ${LMLOG_LLM_MODE:-direct}
       OLLAMA_HOST: ${OLLAMA_HOST:-ollama:11434}
-      LMLOG_MODEL: ${LMLOG_MODEL:-qwen2.5:3b}
+      LMLOG_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
     volumes:
       - logs:/data/logs
       - state:/state
@@ -47,8 +48,9 @@ services:
     environment:
       LMLOG_DB: /state/lmlog.db
       LMLOG_LOG_DIR: /data/logs
+      LMLOG_LLM_MODE: ${LMLOG_LLM_MODE:-direct}
       OLLAMA_HOST: ${OLLAMA_HOST:-ollama:11434}
-      LMLOG_MODEL: ${LMLOG_MODEL:-qwen2.5:3b}
+      LMLOG_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
     volumes:
       - logs:/data/logs
       - state:/state
@@ -56,17 +58,77 @@ services:
       generator:
         condition: service_completed_successfully
 
-  # Optional local LLM for AI explanations: `make llm`
+  # Optional HTTP API: `make serve` or `docker compose --profile serve up -d serve`.
+  serve:
+    build:
+      context: .
+      args:
+        INSTALL_SERVE: "true"
+    image: lmlog:serve
+    profiles: ["serve"]
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8090"
+    restart: unless-stopped
+    environment:
+      LMLOG_API_TOKEN: ${LMLOG_API_TOKEN:?set LMLOG_API_TOKEN in .env}
+      LMLOG_SERVE_DATA_DIR: /serve
+      LMLOG_SERVE_MAX_UPLOAD_MB: ${LMLOG_SERVE_MAX_UPLOAD_MB:-50}
+      LMLOG_LLM_MODE: ${LMLOG_LLM_MODE:-direct}
+      OLLAMA_HOST: ${OLLAMA_HOST:-ollama:11434}
+      LMLOG_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+    ports:
+      - "127.0.0.1:${LMLOG_SERVE_PORT:-8090}:8090"
+    volumes:
+      - serve:/serve
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # Optional standalone-dev LLM. Full-stack deployments use infra/ instead.
   ollama:
     image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
-    profiles: ["llm"]
+    profiles: ["ai", "llm"]
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
     volumes:
       - ollama:/root/.ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # One-shot model pull. The model is never baked into the image.
+  ollama-pull:
+    image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    profiles: ["ai", "llm"]
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-qwen2.5:3b}"]
+    volumes:
+      - ollama:/root/.ollama
 
 volumes:
   logs:
   state:
+  serve:
   ollama:

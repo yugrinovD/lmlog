@@ -121,16 +121,21 @@ These are rule-based and require no model.
 
 ### 7. Explanation
 
-Two interchangeable backends:
+Two interchangeable LLM transports and one deterministic backend:
 
-- **Ollama** (`/api/generate`) with a prompt that requests severity, what is
-  happening, likely cause and what to check.
+- **gogate gateway** (default) — OpenAI-compatible `/v1/chat/completions`; the
+  prompt requests severity, what is happening, likely cause and what to check.
+  `lmlog` acts as a gateway consumer and does not own retries, limits, cache or
+  metrics.
+- **Direct Ollama** (`/api/generate`) — standalone development only
+  (`LMLOG_LLM_MODE=direct`).
 - **Heuristic rules** — regex-based categories (storage/HTTP, database, SMTP,
   consumers, timeouts, missing workers, memory, uncaught exceptions) with
   actionable checks.
 
-The heuristic backend is the default fallback. Explanations are cached in SQLite
-per signature, so repeated runs for the same template are instant.
+The heuristic backend is the default fallback when the gateway/Ollama is
+unavailable. Explanations are cached in SQLite per signature, so repeated runs
+for the same template are instant.
 
 ## Storage model
 
@@ -188,4 +193,4 @@ queries do not re-parse timestamps.
 - A read-only web dashboard over the snapshot.
 - Export to OpenTelemetry / Prometheus.
 - Signature fingerprints shipped across installations to recognise known issues.
-- A pluggable LLM backend (llama.cpp server, OpenAI-compatible endpoints).
+- Additional gateway providers (configured in gogate, not in lmlog).

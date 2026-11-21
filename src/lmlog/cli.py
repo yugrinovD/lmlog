@@ -375,13 +375,13 @@ def cmd_classes(args) -> int:
 
 def cmd_explain(args) -> int:
     from .explain import choose_explanation
-    from .llm import OllamaClient
+    from .llm import create_client
 
     state = State(args.db)
-    client = OllamaClient(model=args.model, timeout=args.timeout)
+    client = create_client(model=args.model, timeout=args.timeout)
     use_llm = not args.no_llm
     if use_llm and not client.health():
-        print("Ollama is not available; using heuristic explanations.")
+        print(f"{client.label} is not available; using heuristic explanations.")
         use_llm = False
 
     clusterer, stats, created = resolve_clusterer(args, state)
@@ -426,7 +426,7 @@ def cmd_explain(args) -> int:
 def cmd_trends(args) -> int:
     from .detect import detect_trends
     from .explain import choose_explanation
-    from .llm import OllamaClient
+    from .llm import create_client
 
     state = State(args.db)
     if args.live or args.incremental:
@@ -462,10 +462,10 @@ def cmd_trends(args) -> int:
         print("No anomalies or trends detected.")
         return 0
 
-    client = OllamaClient(model=args.model, timeout=args.timeout)
+    client = create_client(model=args.model, timeout=args.timeout)
     use_llm = args.explain and not args.no_llm
     if use_llm and not client.health():
-        print("Ollama is not available; using heuristic explanations.")
+        print(f"{client.label} is not available; using heuristic explanations.")
         use_llm = False
 
     print(f"Trends: {len(findings)}\n")
@@ -559,6 +559,39 @@ def cmd_daemon(args) -> int:
         since_hours=args.since,
         workers=args.workers,
     )
+
+
+def cmd_serve(args) -> int:
+    from .serve.app import create_app
+
+    try:
+        app = create_app(
+            data_dir=args.data_dir,
+            max_upload_mb=args.max_upload_mb,
+            use_llm=not args.no_llm,
+            max_jobs=args.max_jobs,
+            job_ttl_hours=args.job_ttl_hours,
+            concurrency=args.concurrency,
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        import uvicorn
+    except ImportError:
+        print(
+            'error: uvicorn is not installed. Install the serve extra: pip install "lmlog[serve]"',
+            file=sys.stderr,
+        )
+        return 2
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        access_log=args.access_log,
+    )
+    return 0
 
 
 def cmd_bench(args) -> int:
@@ -762,6 +795,31 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--status", action="store_true")
     daemon.add_argument("--stop", action="store_true")
     daemon.set_defaults(func=cmd_daemon)
+
+    serve = sub.add_parser(
+        "serve",
+        help="run the optional HTTP API (requires the serve extra)",
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8090)
+    serve.add_argument("--data-dir", default=None, help="upload/job storage directory")
+    serve.add_argument(
+        "--max-upload-mb",
+        type=float,
+        default=None,
+        help="upload limit in MiB (default: 50, maximum: 500)",
+    )
+    serve.add_argument("--max-jobs", type=int, default=None)
+    serve.add_argument("--job-ttl-hours", type=int, default=None)
+    serve.add_argument("--concurrency", type=int, default=None)
+    serve.add_argument("--no-llm", action="store_true", help="use heuristic explanations only")
+    serve.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+    )
+    serve.add_argument("--access-log", action="store_true")
+    serve.set_defaults(func=cmd_serve)
 
     bench = sub.add_parser("bench", help="measure ingest throughput on synthetic logs")
     bench.add_argument("--lines", type=int, default=1_000_000)
