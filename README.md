@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/yugrinovD/lmlog/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/yugrinovD/lmlog/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/yugrinovD/lmlog)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/yugrinovD/lmlog?sort=semver)](https://github.com/yugrinovD/lmlog/releases)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 
 **Локальный CPU-first анализатор логов: сигнатуры, ошибки, аномалии и объяснения для очень больших объёмов.**
@@ -20,7 +21,7 @@
 Проект рассчитан на **50 млн строк в сутки и больше**, не требует GPU, не
 отправляет данные наружу и работает в изолированных (air-gapped) средах.
 
-[English version](README.en.md)
+[English version](README.en.md) · [Changelog](CHANGELOG.md)
 
 ---
 
@@ -36,6 +37,8 @@
 2. **Детекция**: ошибки, новые шаблоны, аномальный рост и «замолчавшие» паттерны.
 3. **Объяснение**: локальная LLM или эвристический fallback отвечает, что
    происходит, насколько это критично и что проверить.
+
+![lmlog demo](docs/demo.gif)
 
 ## Ключевые возможности
 

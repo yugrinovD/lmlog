@@ -27,3 +27,35 @@ jobs:
           ruff format --check .
       - name: Test
         run: pytest --cov=lmlog --cov-report=term-missing
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[serve]"
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit --skip-editable
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t lmlog:ci .
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: lmlog:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
