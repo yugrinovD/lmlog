@@ -124,6 +124,8 @@ class State:
             self._ensure_column(con, "offsets", "inode", "INTEGER DEFAULT 0")
             self._ensure_column(con, "snapshot", "first_key", "TEXT")
             self._ensure_column(con, "snapshot", "last_key", "TEXT")
+            self._ensure_column(con, "explanations", "source", "TEXT")
+            self._ensure_column(con, "explanations", "model", "TEXT")
 
             if "meta" not in existing_tables:
                 # A freshly created database already has the current schema.
@@ -394,25 +396,39 @@ class State:
 
     # --- explanations cache ---
 
-    def get_explanation(self, signature: str) -> str | None:
+    def get_explanation_entry(self, signature: str) -> dict | None:
         with self.conn() as con:
             row = con.execute(
-                "SELECT text FROM explanations WHERE signature=?",
+                "SELECT text, source, model FROM explanations WHERE signature=?",
                 (signature,),
             ).fetchone()
-        return row["text"] if row else None
+        if not row:
+            return None
+        return {"text": row["text"], "source": row["source"], "model": row["model"]}
 
-    def set_explanation(self, signature: str, text: str) -> None:
+    def get_explanation(self, signature: str) -> str | None:
+        entry = self.get_explanation_entry(signature)
+        return entry["text"] if entry else None
+
+    def set_explanation(
+        self,
+        signature: str,
+        text: str,
+        source: str = "heuristic",
+        model: str | None = None,
+    ) -> None:
         with self.conn() as con:
             con.execute(
                 """
-                INSERT INTO explanations(signature, created, text)
-                VALUES(?,?,?)
+                INSERT INTO explanations(signature, created, text, source, model)
+                VALUES(?,?,?,?,?)
                 ON CONFLICT(signature) DO UPDATE SET
                     created=excluded.created,
-                    text=excluded.text
+                    text=excluded.text,
+                    source=excluded.source,
+                    model=excluded.model
                 """,
-                (signature, time.strftime("%Y-%m-%d %H:%M:%S"), text),
+                (signature, time.strftime("%Y-%m-%d %H:%M:%S"), text, source, model),
             )
 
     # --- snapshot: fast queries over the saved cluster state ---

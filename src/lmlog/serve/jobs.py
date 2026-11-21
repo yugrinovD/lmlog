@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from collections import deque
@@ -111,6 +112,11 @@ class JobManager:
         self.job_ttl_hours = job_ttl_hours
         self.concurrency = concurrency
         self._jobs: dict[str, Job] = {}
+        # FastAPI runs sync endpoints such as list_jobs in a threadpool while
+        # async uploads mutate _jobs on the event loop. Protect every iteration
+        # and mutation so a concurrent insert cannot raise
+        # "dictionary changed size during iteration".
+        self._lock = threading.RLock()
         self._tasks: set[asyncio.Task] = set()
         self._semaphore: asyncio.Semaphore | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -129,14 +135,17 @@ class JobManager:
         self._save(job)
 
     def _save(self, job: Job) -> None:
-        path = self._job_json(job.id)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(job.to_disk(), fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        # Serialize with remove/prune so a concurrent retention pass cannot
+        # delete the directory while job.json is being written.
+        with self._lock:
+            path = self._job_json(job.id)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(job.to_disk(), fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
 
     def _load_existing(self) -> None:
         if not os.path.isdir(self.jobs_dir):
@@ -192,7 +201,8 @@ class JobManager:
             size_bytes=size_bytes,
             db_path=os.path.join(directory, "state.db"),
         )
-        self._jobs[job_id] = job
+        with self._lock:
+            self._jobs[job_id] = job
         self._save(job)
         self._prune()
         return job, os.path.join(directory, stored_name)
@@ -200,18 +210,26 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         if not _is_uuid(job_id):
             return None
-        return self._jobs.get(job_id)
+        with self._lock:
+            return self._jobs.get(job_id)
 
     def list(self, limit: int = 20) -> list[Job]:
-        items = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+        with self._lock:
+            items = list(self._jobs.values())
+        items.sort(key=lambda j: j.created_at, reverse=True)
         return items[: max(1, min(limit, 100))]
 
+    def count(self) -> int:
+        with self._lock:
+            return len(self._jobs)
+
     def remove(self, job_id: str) -> bool:
-        job = self._jobs.pop(job_id, None)
-        if job is None:
-            return False
-        shutil.rmtree(self._job_dir(job_id), ignore_errors=True)
-        return True
+        with self._lock:
+            job = self._jobs.pop(job_id, None)
+            if job is None:
+                return False
+            shutil.rmtree(self._job_dir(job_id), ignore_errors=True)
+            return True
 
     # --- execution ---
 
@@ -369,7 +387,9 @@ class JobManager:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        for job in self._jobs.values():
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
             if not job.terminal:
                 job.status = "failed"
                 job.error = "server stopped before the job finished"
@@ -380,18 +400,24 @@ class JobManager:
 
     def _prune(self) -> None:
         cutoff = time.time() - self.job_ttl_hours * 3600
-        ordered = sorted(self._jobs.values(), key=lambda j: j.created_at)
-        remove: list[str] = []
-        for job in ordered:
-            try:
-                created = datetime.fromisoformat(job.created_at).timestamp()
-            except ValueError:
-                created = time.time()
-            if created < cutoff:
-                remove.append(job.id)
-        for job in ordered[: max(0, len(ordered) - self.max_jobs)]:
-            if job.id not in remove:
-                remove.append(job.id)
+        with self._lock:
+            ordered = sorted(self._jobs.values(), key=lambda j: j.created_at)
+            remove: list[str] = []
+            for job in ordered:
+                if not job.terminal:
+                    # Never delete a queued/running job directory: its worker
+                    # still writes to it and would fail or leave orphan files.
+                    continue
+                try:
+                    created = datetime.fromisoformat(job.created_at).timestamp()
+                except ValueError:
+                    created = time.time()
+                if created < cutoff:
+                    remove.append(job.id)
+            terminal = [job for job in ordered if job.terminal]
+            for job in terminal[: max(0, len(terminal) - self.max_jobs)]:
+                if job.id not in remove:
+                    remove.append(job.id)
         for job_id in remove:
             self.remove(job_id)
 

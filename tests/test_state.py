@@ -60,8 +60,20 @@ def test_daily_counts_replace_and_add(tmp_path):
 def test_explanations_and_meta(tmp_path):
     state = State(str(tmp_path / "state.db"))
     assert state.get_explanation("sig") is None
-    state.set_explanation("sig", "text")
+    assert state.get_explanation_entry("sig") is None
+    state.set_explanation("sig", "text", source="llm", model="qwen2.5:3b")
     assert state.get_explanation("sig") == "text"
+    assert state.get_explanation_entry("sig") == {
+        "text": "text",
+        "source": "llm",
+        "model": "qwen2.5:3b",
+    }
+    state.set_explanation("sig", "fallback", source="heuristic")
+    assert state.get_explanation_entry("sig") == {
+        "text": "fallback",
+        "source": "heuristic",
+        "model": None,
+    }
     state.set_meta("k", "v")
     assert state.get_meta("k") == "v"
 

@@ -410,13 +410,14 @@ def cmd_explain(args) -> int:
         print("  msg: " + (finding.sample[:160] if finding.sample else ""))
         print("  note: " + finding.note)
 
-        cached = None if args.refresh else state.get_explanation(finding.signature)
-        if cached:
+        cached = None if args.refresh else state.get_explanation_entry(finding.signature)
+        if cached and (use_llm or cached.get("source") != "llm"):
             print("\n  [cache]")
-            print(cached)
+            print(cached["text"])
             continue
         text, source = choose_explanation(finding, client, use_llm, period)
-        state.set_explanation(finding.signature, text)
+        if not (cached and cached.get("source") == "llm" and source == "heuristic"):
+            state.set_explanation(finding.signature, text, source=source)
         print(f"\n  [{source}]")
         print(text)
         print()

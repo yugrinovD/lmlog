@@ -11,6 +11,7 @@ import hmac
 import logging
 import os
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -116,6 +117,24 @@ def create_app(
     app.state.snapshots = snapshots
     app.state.use_llm = use_llm
     app.state.llm_semaphore = llm_semaphore
+
+    # Health polling should not hammer the gateway or block on every request.
+    # Cache the probe for a short period; the UI polls every 30 seconds.
+    llm_health_lock = threading.Lock()
+    llm_health_state = {"checked_at": 0.0, "available": False}
+
+    def llm_available() -> bool:
+        if not app.state.use_llm:
+            return False
+        now = time.monotonic()
+        with llm_health_lock:
+            if now - llm_health_state["checked_at"] < 15:
+                return bool(llm_health_state["available"])
+        available = create_client().health()
+        with llm_health_lock:
+            llm_health_state["checked_at"] = time.monotonic()
+            llm_health_state["available"] = available
+        return available
 
     # --- middleware -------------------------------------------------------
 
@@ -268,10 +287,12 @@ def create_app(
         return {
             "status": "ok",
             "version": __version__,
-            "jobs": len(manager._jobs),
+            "jobs": manager.count(),
             "llm": {
                 "mode": llm_mode(),
                 "model": default_model(),
+                "enabled": bool(app.state.use_llm),
+                "available": llm_available(),
             },
         }
 
@@ -314,8 +335,12 @@ def create_app(
 
         job, path = manager.create(original, 0)
         size = 0
+        # Uploads can be tens of megabytes. Opening/writing/closing a file on
+        # the event loop would stall SSE progress and health checks for other
+        # jobs, so keep the disk work in the threadpool.
         try:
-            with open(path, "wb") as destination:
+            destination = await asyncio.to_thread(open, path, "wb")
+            try:
                 while True:
                     chunk = await file.read(1024 * 1024)
                     if not chunk:
@@ -329,14 +354,16 @@ def create_app(
                                 "message": f"upload limit is {manager.max_upload_bytes} bytes",
                             },
                         )
-                    destination.write(chunk)
+                    await asyncio.to_thread(destination.write, chunk)
+            finally:
+                await asyncio.to_thread(destination.close)
             if size == 0:
                 raise HTTPException(
                     status_code=400,
                     detail={"code": "empty_file", "message": "uploaded file is empty"},
                 )
             job.size_bytes = size
-            manager.save(job)
+            await asyncio.to_thread(manager.save, job)
         except BaseException:
             manager.remove(job.id)
             raise
@@ -591,18 +618,22 @@ def create_app(
                 detail={"code": "signature_not_found", "message": "signature not found"},
             )
         state = State(job.db_path)
+        use_llm = payload.use_llm and app.state.use_llm
+        cached = None
         if not payload.refresh:
-            cached = state.get_explanation(payload.signature)
-            if cached:
+            cached = state.get_explanation_entry(payload.signature)
+            # Do not serve a cached LLM answer when the caller explicitly asked
+            # for heuristics, and do not pin a heuristic answer once the LLM is
+            # requested again: retrying lets the cache recover after an outage.
+            if cached and (use_llm or cached.get("source") != "llm"):
                 return {
                     "signature": payload.signature,
-                    "text": cached,
+                    "text": cached["text"],
                     "source": "cache",
                     "cached": True,
-                    "model": None,
+                    "model": cached.get("model"),
                 }
         finding = snapshot.finding(cluster)
-        use_llm = payload.use_llm and app.state.use_llm
         client = create_client()
         if use_llm and not client.health():
             use_llm = False
@@ -613,13 +644,19 @@ def create_app(
                 use_llm,
                 period=f"snapshot from {snapshot.created or 'unknown time'}",
             )
-        state.set_explanation(payload.signature, text)
+        model = default_model() if source == "llm" else None
+        # A heuristic-only request must not destroy a better cached LLM answer.
+        preserve_llm_cache = (
+            cached is not None and cached.get("source") == "llm" and source == "heuristic"
+        )
+        if not preserve_llm_cache:
+            state.set_explanation(payload.signature, text, source=source, model=model)
         return {
             "signature": payload.signature,
             "text": text,
             "source": source,
             "cached": False,
-            "model": default_model() if source == "llm" else None,
+            "model": model,
         }
 
     @app.post(

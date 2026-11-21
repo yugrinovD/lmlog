@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from lmlog.serve.app import create_app  # noqa: E402
 from lmlog.serve.jobs import sanitize_filename  # noqa: E402
+from lmlog.state import State  # noqa: E402
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -49,7 +50,10 @@ def wait_for(client, job_id, timeout=10.0):
 def test_health_is_public(client):
     response = client.get("/healthz")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["llm"]["enabled"] is False
+    assert payload["llm"]["available"] is False
 
 
 def test_api_requires_bearer_token(client):
@@ -180,6 +184,36 @@ def test_explain_and_chat_use_heuristic_fallback(client):
     assert answer["source"] == "heuristic"
     assert answer["citations"]
     assert "No retrieval" in answer["note"]
+
+
+def test_explain_does_not_return_cached_llm_text_when_llm_is_disabled(client):
+    response = upload(client)
+    job_id = response.json()["job_id"]
+    wait_for(client, job_id)
+    signature = client.get(f"/api/v1/snapshots/{job_id}/errors?limit=1", headers=AUTH).json()[
+        "items"
+    ][0]["signature"]
+
+    job = client.app.state.manager.get(job_id)
+    State(job.db_path).set_explanation(
+        signature, "cached llm answer", source="llm", model="qwen2.5:3b"
+    )
+
+    explained = client.post(
+        "/api/v1/explain",
+        headers=AUTH,
+        json={"snapshot_id": job_id, "signature": signature, "use_llm": False},
+    )
+    assert explained.status_code == 200
+    payload = explained.json()
+    assert payload["source"] == "heuristic"
+    assert payload["text"] != "cached llm answer"
+    assert "WHAT IS HAPPENING" in payload["text"]
+    assert State(job.db_path).get_explanation_entry(signature) == {
+        "text": "cached llm answer",
+        "source": "llm",
+        "model": "qwen2.5:3b",
+    }
 
 
 def test_explain_rejects_unknown_signature(client):
