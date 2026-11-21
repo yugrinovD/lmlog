@@ -1,0 +1,8 @@
+# lmlog has no mandatory third-party runtime dependencies.
+# The project metadata in pyproject.toml is the single source of truth.
+#
+# Local development:
+#   pip install -e ".[dev]"
+#
+# Optional JSON acceleration:
+#   pip install -e ".[fast]"
