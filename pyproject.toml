@@ -18,7 +18,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-fast = ["orjson>=3.9"]
+fast = ["orjson>=3.13.0"]
 serve = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
